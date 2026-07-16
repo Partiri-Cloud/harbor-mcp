@@ -1,0 +1,55 @@
+{
+  "name": "@partiri-cloud/harbor-mcp",
+  "version": "0.2.1",
+  "description": "MCP server for Partiri Cloud",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/partiri-cloud/harbor-mcp.git"
+  },
+  "homepage": "https://partiri.cloud/documentation/mcp",
+  "bugs": {
+    "url": "https://github.com/partiri-cloud/harbor-mcp/issues"
+  },
+  "type": "module",
+  "bin": {
+    "partiri-cloud-mcp": "dist/index.mjs"
+  },
+  "main": "dist/index.mjs",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "start": "node dist/index.mjs",
+    "build": "tsdown src/index.ts --format esm",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.3.2",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.5.2",
+    "@types/supertest": "^7.2.0",
+    "eslint": "^10.5.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.8.4",
+    "supertest": "^7.2.2",
+    "tsdown": "^0.22.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.61.1",
+    "vitest": "^4.1.8"
+  }
+}

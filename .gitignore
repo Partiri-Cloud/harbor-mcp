@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.vscode/
+
+*.env
+*.env.*
+!*.env.example
+!.env.example
+
+*.partiri.jsonc
+
+# Claude Code local tooling — not part of the published package
+.claude/
