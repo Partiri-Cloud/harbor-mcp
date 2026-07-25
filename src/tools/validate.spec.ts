@@ -8,8 +8,25 @@ function mockClient(): PartiriApiClient {
   return {
     probeGitRepository: vi.fn().mockResolvedValue({}),
     probeRegistry: vi.fn().mockResolvedValue({}),
+    // Stubbed so the cost/balance tail of the handler stays silent: an
+    // unstubbed method throws a TypeError that the handler swallows into
+    // `balance_note`, which would mask what these tests are asserting.
+    getPricing: vi.fn().mockResolvedValue({ pods: [], volume_price_per_gb: 0 }),
+    getBalance: vi.fn().mockResolvedValue({ amount: 100, currency: 'EUR' }),
   } as unknown as PartiriApiClient;
 }
+
+/** Parse the `validate_service` payload back into its structured result. */
+function payload(result: unknown): {
+  valid: boolean;
+  checks: Array<{ field: string; ok: boolean; message: string }>;
+  balance_note?: string;
+} {
+  return (result as { structuredContent: ReturnType<typeof payload> })
+    .structuredContent;
+}
+
+const WORKSPACE_ID = '11111111-1111-4111-8111-111111111111';
 
 const base = {
   name: 'svc',
@@ -17,6 +34,7 @@ const base = {
   runtime: 'node',
   rootPath: '/',
   probeReachability: true,
+  workspaceId: WORKSPACE_ID,
 };
 
 describe('validate_service SSRF guards', () => {
@@ -37,6 +55,71 @@ describe('validate_service SSRF guards', () => {
     const client = mockClient();
     await handler(client, { ...base, repositoryUrl: 'https://github.com/o/r' });
     expect(client.probeGitRepository).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends the workspace the API authorizes the probe against', async () => {
+    const client = mockClient();
+    await handler(client, { ...base, repositoryUrl: 'https://github.com/o/r' });
+    expect(client.probeGitRepository).toHaveBeenCalledWith({
+      workspace: WORKSPACE_ID,
+      url: 'https://github.com/o/r',
+    });
+
+    await handler(client, { ...base, registryUrl: 'ghcr.io/o/i:v1' });
+    expect(client.probeRegistry).toHaveBeenCalledWith({
+      workspace: WORKSPACE_ID,
+      registry_url: 'ghcr.io/o/i:v1',
+    });
+  });
+
+  it('reports the missing workspaceId on each source instead of calling the API', async () => {
+    const client = mockClient();
+    const result = payload(
+      await handler(client, {
+        ...base,
+        workspaceId: undefined,
+        repositoryUrl: 'https://github.com/o/r',
+        registryUrl: 'ghcr.io/o/i:v1',
+      }),
+    );
+
+    expect(client.probeGitRepository).not.toHaveBeenCalled();
+    expect(client.probeRegistry).not.toHaveBeenCalled();
+    expect(result.valid).toBe(false);
+    for (const field of ['repository_reachability', 'registry_reachability']) {
+      const check = result.checks.find((c) => c.field === field);
+      expect(check).toBeDefined();
+      expect(check!.ok).toBe(false);
+      expect(check!.message).toContain('workspaceId is required');
+    }
+  });
+
+  it('emits no reachability check when there is no URL to probe', async () => {
+    const client = mockClient();
+    const result = payload(
+      await handler(client, { ...base, workspaceId: undefined }),
+    );
+
+    expect(result.checks.some((c) => c.field.endsWith('_reachability'))).toBe(
+      false,
+    );
+  });
+
+  it('reports the SSRF verdict, not the missing workspaceId, for a private host', async () => {
+    const client = mockClient();
+    const result = payload(
+      await handler(client, {
+        ...base,
+        workspaceId: undefined,
+        repositoryUrl: 'http://127.0.0.1/x',
+      }),
+    );
+
+    const check = result.checks.find(
+      (c) => c.field === 'repository_reachability',
+    );
+    expect(check!.ok).toBe(false);
+    expect(check!.message).toContain('must be a public http(s) address');
   });
 
   it('does not probe a private/loopback registry host', async () => {

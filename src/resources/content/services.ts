@@ -174,9 +174,9 @@ validate_service({
   name, deployType, runtime, rootPath,
   fkRegion, fkPod,
   repositoryUrl,        // or registryUrl
-  fkServiceSecret,      // optional; enables reachability probe
+  fkServiceSecret,      // optional; authenticates the reachability probe
   probeReachability: true,
-  workspaceId,          // optional; enables balance check
+  workspaceId,          // required to probe reachability; also enables balance check
   diskSizeGb,           // optional; included in cost estimate
 })
 \`\`\`

@@ -131,7 +131,7 @@ The protected-resource metadata (RFC 9728) is served at both `/.well-known/oauth
 | `get_service` | Get service details |
 | `create_service` | Create a new service |
 | `update_service` | Update service configuration |
-| `validate_service` | Preflight-validate a service config; optionally probe repo/registry reachability |
+| `validate_service` | Preflight-validate a service config; optionally probe repo/registry reachability (needs `workspaceId`) |
 | `deploy_service` | Trigger a new deployment |
 | `pause_service` | Pause a running service |
 | `unpause_service` | Resume a paused service |

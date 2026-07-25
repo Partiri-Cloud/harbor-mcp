@@ -68,8 +68,8 @@ run \`partiri llm guide\` for the exact command, and pass any token on \`stdin\`
 the argument list.
 
 Pass the resulting secret \`id\` as \`fkServiceSecret\` when creating or updating a service. You can also call
-\`validate_service\` with \`probeReachability: true\` and \`fkServiceSecret\` set to confirm access
-before deploying.`,
+\`validate_service\` with \`probeReachability: true\`, \`fkServiceSecret\` and \`workspaceId\` set to confirm
+access before deploying (the probe is authorized against that workspace).`,
   },
   {
     name: 'Registry providers',
@@ -91,8 +91,8 @@ dashboard or by running the \`partiri\` CLI yourself (the \`use_partiri_cli\` to
 run \`partiri llm guide\` for the exact command, and pass any password on \`stdin\`.
 
 Pass the resulting secret \`id\` as \`fkServiceSecret\` when creating or updating a service. You can also call
-\`validate_service\` with \`probeReachability: true\` and \`fkServiceSecret\` set to confirm access
-before deploying.`,
+\`validate_service\` with \`probeReachability: true\`, \`fkServiceSecret\` and \`workspaceId\` set to confirm
+access before deploying (the probe is authorized against that workspace).`,
   },
   {
     name: 'Scaling & pod sizes',

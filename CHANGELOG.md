@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-07-25
+
+### Fixed
+
+- `validate_service` reachability probes now send the `workspace` query param the
+  Partiri API requires on `GET /resources/utils/git` and `/resources/utils/reg`.
+  Without it the API answers 403, which the tool reported as an unreachable
+  repository or registry. `workspaceId` is therefore required whenever
+  `probeReachability` is set; when it is missing the affected source reports the
+  missing argument instead of an outbound call that cannot succeed. A private or
+  loopback host still reports the SSRF refusal first.
+
 ## [0.1.12] — 2026-06-23
 
 ### Security

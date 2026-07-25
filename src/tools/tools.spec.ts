@@ -688,6 +688,7 @@ describe('validate_service probe branches', () => {
     buildCommand: 'npm run build',
     runCommand: 'npm start',
     probeReachability: true,
+    workspaceId: WS_ID,
   };
 
   it('records repository_reachability ok=true on probe success', async () => {
@@ -702,6 +703,9 @@ describe('validate_service probe branches', () => {
     );
     expect(check).toBeDefined();
     expect(check.ok).toBe(true);
+
+    const [url] = fetchMock.mock.calls[0] as [URL];
+    expect(String(url)).toContain(`workspace=${WS_ID}`);
   });
 
   it('records repository_reachability ok=false on probe failure', async () => {

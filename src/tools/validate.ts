@@ -40,6 +40,14 @@ interface ValidationCheck {
 }
 
 /**
+ * Reported instead of running a reachability probe when `workspaceId` is
+ * absent: `GET /resources/utils/git` and `/resources/utils/reg` both require a
+ * `workspace` query param and answer 403 without one.
+ */
+const MISSING_WORKSPACE_MESSAGE =
+  'workspaceId is required to probe reachability (the API authorizes the probe against that workspace)';
+
+/**
  * Tool definitions declared by this module: `validate_service`, a preflight
  * checker for service configuration (source XOR rule, deploy_type/runtime
  * compatibility, name length) with optional reachability probing and cost
@@ -74,7 +82,7 @@ export const definitions: ToolDefinition[] = [
         .uuid()
         .optional()
         .describe(
-          'Workspace UUID — used to check balance (billing:r permission required)',
+          'Workspace UUID — used to check balance (billing:r permission required) and required when probeReachability is set (the probes are authorized against it)',
         ),
       repositoryUrl: z
         .string()
@@ -109,7 +117,7 @@ export const definitions: ToolDefinition[] = [
         .boolean()
         .optional()
         .describe(
-          'When true, probe the git repository or registry for reachability (probed whenever repositoryUrl or registryUrl is present)',
+          'When true, probe the git repository or registry for reachability (probed whenever repositoryUrl or registryUrl is present; requires workspaceId)',
         ),
     }),
     annotations: {
@@ -256,6 +264,10 @@ export const handlers: Map<string, ToolHandler> = new Map([
       const checks = validateConfig(args);
       const reachabilityChecks: ValidationCheck[] = [];
 
+      // Read once: the probes are authorized against this workspace, and the
+      // balance check below reports on it.
+      const workspaceId = args.workspaceId as string | undefined;
+
       if (args.probeReachability) {
         const repositoryUrl = args.repositoryUrl as string | undefined;
         const registryUrl = args.registryUrl as string | undefined;
@@ -270,9 +282,21 @@ export const handlers: Map<string, ToolHandler> = new Map([
             message:
               'Git repository URL must be a public http(s) address (private, loopback, and link-local hosts are not probed)',
           });
-        } else if (repositoryUrl) {
+        } else if (repositoryUrl && !workspaceId) {
+          // Both probe endpoints require `workspace` — it is what the API
+          // checks `workspace:r` against. Without it the probe comes back 403,
+          // so name the missing argument instead of calling the URL unreachable.
+          reachabilityChecks.push({
+            field: 'repository_reachability',
+            ok: false,
+            message: MISSING_WORKSPACE_MESSAGE,
+          });
+        } else if (repositoryUrl && workspaceId) {
           try {
-            const query: Record<string, string> = { url: repositoryUrl };
+            const query: Record<string, string> = {
+              workspace: workspaceId,
+              url: repositoryUrl,
+            };
             if (secretId) query.id = secretId;
             await client.probeGitRepository(query);
             reachabilityChecks.push({
@@ -296,9 +320,18 @@ export const handlers: Map<string, ToolHandler> = new Map([
             message:
               'Container registry host must be a public address (private, loopback, and link-local hosts are not probed)',
           });
-        } else if (registryUrl) {
+        } else if (registryUrl && !workspaceId) {
+          reachabilityChecks.push({
+            field: 'registry_reachability',
+            ok: false,
+            message: MISSING_WORKSPACE_MESSAGE,
+          });
+        } else if (registryUrl && workspaceId) {
           try {
-            const query: Record<string, string> = { registry_url: registryUrl };
+            const query: Record<string, string> = {
+              workspace: workspaceId,
+              registry_url: registryUrl,
+            };
             if (secretId) query.id = secretId;
             await client.probeRegistry(query);
             reachabilityChecks.push({
@@ -351,7 +384,6 @@ export const handlers: Map<string, ToolHandler> = new Map([
       }
 
       // Balance check — informational only, never blocks
-      const workspaceId = args.workspaceId as string | undefined;
       if (workspaceId) {
         try {
           const balance = await client.getBalance(workspaceId);

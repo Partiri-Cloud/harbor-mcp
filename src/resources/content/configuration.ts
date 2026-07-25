@@ -87,7 +87,7 @@ A repository secret can be attached to a service by running
 
 1. Obtain a secret UUID — create it in the dashboard, or by running the \`partiri\` CLI yourself (\`use_partiri_cli\` returns guidance; consult \`partiri llm guide\` for the exact command). \`partiri llm context\` lists existing repository secrets.
 2. Pass \`fkServiceSecret: "<id>"\` to \`create_service\` (or \`update_service\` to update an existing service).
-3. Optionally call \`validate_service\` with \`probeReachability: true\` to confirm the repository is reachable.
+3. Optionally call \`validate_service\` with \`probeReachability: true\` and \`workspaceId\` set to confirm the repository is reachable.
 
 ## Git repository providers
 
