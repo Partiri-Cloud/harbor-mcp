@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-08-01
+
+### Fixed
+
+- The `partiri://docs/deployments/scaling` resource claimed pods were "billed per
+  second of uptime, so you only pay for what you use". That is not how a
+  long-running service is billed: pod pricing is a flat monthly rate per size,
+  charged in full when the service is created, renewed monthly, and charged once
+  per region replica — actual CPU and memory consumption is never an input. The
+  incorrect wording told agents an oversized pod was nearly free and drove them
+  to over-provision, at real cost to the user. The resource now states the
+  billing model accurately, notes that a later downsize refunds only whole
+  remaining days of the already-charged month, and advises picking the cheapest
+  pod that meets the workload with `list_pods` and `get_pricing`. It also points
+  at `update_service` for resizing instead of the dashboard.
+
 ## [0.2.2] — 2026-07-25
 
 ### Fixed

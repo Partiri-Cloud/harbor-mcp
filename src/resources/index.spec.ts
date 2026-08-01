@@ -26,6 +26,40 @@ describe('allResources', () => {
   });
 });
 
+describe('scaling doc', () => {
+  const scaling = allResources.find(
+    (r) => r.uri === 'partiri://docs/deployments/scaling',
+  );
+
+  it('exists', () => {
+    expect(scaling).toBeDefined();
+  });
+
+  it('does not claim usage-based billing', () => {
+    // This doc used to say pods were "billed per second of uptime, so you only
+    // pay for what you use". Long-running services are billed a flat monthly
+    // rate per size, so that wording told agents an oversized pod was nearly
+    // free and drove them to over-provision. Guard the exact failure mode.
+    expect(scaling!.content).not.toMatch(/per second/i);
+    expect(scaling!.content).not.toMatch(/only pay for what you use/i);
+  });
+
+  it('states the flat monthly, prepaid, per-replica billing model', () => {
+    expect(scaling!.content).toMatch(/flat monthly rate/i);
+    expect(scaling!.content).toMatch(/per region replica/i);
+    expect(scaling!.content).toMatch(/renewed monthly/i);
+  });
+
+  it('tells the reader to pick the cheapest adequate pod', () => {
+    expect(scaling!.content).toMatch(/cheapest pod/i);
+  });
+
+  it('points at the tools rather than the dashboard for resizing', () => {
+    expect(scaling!.content).toMatch(/update_service/);
+    expect(scaling!.content).not.toMatch(/service settings page/i);
+  });
+});
+
 describe('registerResources', () => {
   it('registers all resources on the server', () => {
     const spy = vi.spyOn(McpServer.prototype, 'registerResource');

@@ -102,14 +102,20 @@ access before deploying (the probe is authorized against that workspace).`,
 
 Services run on pods. You select a pod size when creating a service, which determines the CPU and memory available to your container.
 
+**Pick the cheapest pod that meets the workload's needs.** Use \`list_pods\` for the available sizes and \`get_pricing\` for what each one costs in a region, then start at the smallest size that fits.
+
 - **Smaller pods** — suitable for background workers, lightweight APIs, and static sites
 - **Larger pods** — appropriate for compute-intensive workloads, LLM inference, or services that hold state in memory
 
-You can change the pod size at any time from the service settings page. The change takes effect on the next deployment.
+Scaling up later is a single \`update_service\` call with a new \`fkPod\` (or \`partiri service push\` from the CLI), applied on the next deployment. There is no penalty for starting small.
 
-## Billing
+## Billing — read this before choosing a size
 
-Pod sizes are billed per second of uptime, so you only pay for what you use. All pod sizes include a fixed allocation of CPU and memory — there is no bursting or shared-CPU throttling.`,
+Pod pricing is a **flat monthly rate per size**, charged in full when the service is created and renewed monthly. Actual CPU and memory consumption is never an input to the bill: a pod sitting at 2% utilization costs exactly what the same pod costs at 90%. The rate is charged **per region replica**, so a service deployed to two regions pays the rate twice.
+
+Choosing a size that costs 12x more than one that would have sufficed costs 12x from day one, and low usage does not recover it. Downsizing later takes effect immediately, but the refund on the already-charged month is prorated by **whole remaining days, rounded up** — the money spent on an oversized first month is largely spent.
+
+All pod sizes include a fixed allocation of CPU and memory — there is no bursting or shared-CPU throttling.`,
   },
   {
     name: 'Zero-downtime deployments',
