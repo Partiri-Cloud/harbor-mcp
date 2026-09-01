@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-authenticated and was rejected again. The `Authorization` header is now
   validated first; `x-api-key` remains the fallback when no Bearer token is
   present.
+- 401s raised on the legacy `x-api-key` path now carry a `WWW-Authenticate`
+  header with an RFC 9728 `resource_metadata` pointer, matching what the Bearer
+  path already emitted. Without it a rejected client had no way to discover the
+  authorization server from the response.
 
 ## [0.2.3] — 2026-08-01
 

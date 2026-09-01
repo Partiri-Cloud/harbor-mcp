@@ -152,6 +152,31 @@ function jsonRpcError(res: Response, status: number, message: string) {
 }
 
 /**
+ * Write a 401 that also carries the RFC 9728 pointer to this server's
+ * protected-resource metadata.
+ * @remarks Mirrors what `requireBearerAuth` emits on the Bearer path. Without
+ *   it, a 401 raised on the legacy `x-api-key` path gives the client nothing
+ *   to act on: it cannot discover the authorization server, so it re-runs the
+ *   OAuth flow it has already completed and is rejected again.
+ * @param res - The Express response to write to.
+ * @param message - The human-readable error message.
+ * @param resourceMetadataUrl - URL of the protected-resource metadata document.
+ */
+function jsonRpcUnauthorized(
+  res: Response,
+  message: string,
+  resourceMetadataUrl: string,
+) {
+  const escaped = message.replace(/["\\]/g, '');
+  res.setHeader(
+    'WWW-Authenticate',
+    `Bearer error="invalid_token", error_description="${escaped}", ` +
+      `resource_metadata="${resourceMetadataUrl}"`,
+  );
+  jsonRpcError(res, 401, message);
+}
+
+/**
  * Resolve the API key from the request. Checks:
  * 1. OAuth Bearer token (req.auth.extra.apiKey, set by bearerAuth middleware)
  * 2. Legacy x-api-key header
@@ -600,12 +625,13 @@ export function createApp(opts: CreateAppOptions) {
    *   WWW-Authenticate header so clients can discover the authorization
    *   server.
    */
+  const resourceMetadataUrl = new URL(
+    '/.well-known/oauth-protected-resource/mcp',
+    mcpBaseUrl,
+  ).href;
   const bearerAuth = requireBearerAuth({
     verifier: oauthProvider,
-    resourceMetadataUrl: new URL(
-      '/.well-known/oauth-protected-resource/mcp',
-      mcpBaseUrl,
-    ).href,
+    resourceMetadataUrl,
   });
   /**
    * Accept either an OAuth Bearer token or a legacy `x-api-key` header on
@@ -681,7 +707,11 @@ export function createApp(opts: CreateAppOptions) {
 
         const apiKey = resolveApiKey(req);
         if (!apiKey) {
-          jsonRpcError(res, 401, 'Missing authentication');
+          jsonRpcUnauthorized(
+            res,
+            'Missing authentication',
+            resourceMetadataUrl,
+          );
           return;
         }
 
@@ -710,7 +740,7 @@ export function createApp(opts: CreateAppOptions) {
         try {
           await apiClient.getCurrentUser();
         } catch {
-          jsonRpcError(res, 401, 'Invalid API key');
+          jsonRpcUnauthorized(res, 'Invalid API key', resourceMetadataUrl);
           return;
         }
         const server = createServer(apiClient);

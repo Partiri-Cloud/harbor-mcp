@@ -582,6 +582,24 @@ describe('401 discovery contract', () => {
     expect(res.status).toBe(401);
   });
 
+  it('points to the metadata on the legacy path when the API key is rejected', async () => {
+    // The legacy x-api-key path builds its own 401 rather than going through
+    // requireBearerAuth, so it has to carry the pointer itself.
+    vi.mocked(fetch).mockReset();
+    vi.mocked(fetch).mockResolvedValue(new Response('no', { status: 401 }));
+
+    const res = await request(app)
+      .post('/mcp')
+      .set('x-api-key', 'bogus-key')
+      .set('Accept', 'application/json, text/event-stream')
+      .send(MCP_INITIALIZE_BODY);
+
+    expect(res.status).toBe(401);
+    expect(res.headers['www-authenticate']).toContain(
+      'resource_metadata="http://localhost:3000/.well-known/oauth-protected-resource/mcp"',
+    );
+  });
+
   it('answers 401 for a token whose audience names another server', async () => {
     const futureEpoch = Math.floor(Date.now() / 1000) + 3600;
     const foreign = createAccessToken(
