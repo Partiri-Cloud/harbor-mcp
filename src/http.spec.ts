@@ -47,6 +47,27 @@ function createTestApp(sessions?: Map<string, Session>, config?: AppConfig) {
   });
 }
 
+/**
+ * Makes the upstream API accept exactly one API key and reject every other.
+ * Lets a test assert *which* credential the server resolved, by keying the
+ * upstream verdict on the `x-api-key` the client forwards.
+ * @param validKey - The only key `getCurrentUser` will answer 200 for.
+ */
+function onlyAcceptUpstream(validKey: string) {
+  vi.mocked(fetch).mockReset();
+  vi.mocked(fetch).mockImplementation((_url, opts) => {
+    const headers = (opts?.headers ?? {}) as Record<string, string>;
+    return Promise.resolve(
+      headers['x-api-key'] === validKey
+        ? new Response(JSON.stringify({ id: 'u1' }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        : new Response('no', { status: 401 }),
+    );
+  });
+}
+
 describe('HTTP transport', () => {
   let app: ReturnType<typeof createApp>;
 
@@ -183,6 +204,65 @@ describe('HTTP transport', () => {
 
       expect(res.status).toBe(401);
       expect(res.headers['mcp-session-id']).toBeUndefined();
+    });
+
+    it('validates the Bearer token even when a stale x-api-key is also sent', async () => {
+      // A client that has completed OAuth keeps sending the x-api-key from its
+      // config. Only the key inside the token is still accepted upstream, so
+      // this passes only if the token — not the header — resolved the key.
+      onlyAcceptUpstream('key-inside-token');
+
+      const futureEpoch = Math.floor(Date.now() / 1000) + 3600;
+      const token = createAccessToken(
+        'key-inside-token',
+        futureEpoch,
+        TEST_SECRET,
+      );
+
+      const res = await request(app)
+        .post('/mcp')
+        .set('Authorization', `Bearer ${token}`)
+        .set('x-api-key', 'stale-revoked-key')
+        .set('Accept', 'application/json, text/event-stream')
+        .send(MCP_INITIALIZE_BODY);
+
+      expect(res.status).toBe(200);
+      expect(res.headers['mcp-session-id']).toBeDefined();
+    });
+
+    it('binds the session to the token key, not the stale header key', async () => {
+      onlyAcceptUpstream('key-inside-token');
+
+      const futureEpoch = Math.floor(Date.now() / 1000) + 3600;
+      const token = createAccessToken(
+        'key-inside-token',
+        futureEpoch,
+        TEST_SECRET,
+      );
+      const sessions = new Map<string, Session>();
+      const boundApp = createTestApp(sessions);
+
+      await request(boundApp)
+        .post('/mcp')
+        .set('Authorization', `Bearer ${token}`)
+        .set('x-api-key', 'stale-revoked-key')
+        .set('Accept', 'application/json, text/event-stream')
+        .send(MCP_INITIALIZE_BODY);
+
+      const [session] = [...sessions.values()];
+      expect(session.apiKeyHash).toBe(hashApiKey('key-inside-token'));
+    });
+
+    it('still accepts x-api-key alone when no Bearer token is present', async () => {
+      onlyAcceptUpstream('legacy-key');
+
+      const res = await request(app)
+        .post('/mcp')
+        .set('x-api-key', 'legacy-key')
+        .set('Accept', 'application/json, text/event-stream')
+        .send(MCP_INITIALIZE_BODY);
+
+      expect(res.status).toBe(200);
     });
   });
 
@@ -500,6 +580,24 @@ describe('401 discovery contract', () => {
       .set('Accept', 'application/json, text/event-stream')
       .send(MCP_INITIALIZE_BODY);
     expect(res.status).toBe(401);
+  });
+
+  it('points to the metadata on the legacy path when the API key is rejected', async () => {
+    // The legacy x-api-key path builds its own 401 rather than going through
+    // requireBearerAuth, so it has to carry the pointer itself.
+    vi.mocked(fetch).mockReset();
+    vi.mocked(fetch).mockResolvedValue(new Response('no', { status: 401 }));
+
+    const res = await request(app)
+      .post('/mcp')
+      .set('x-api-key', 'bogus-key')
+      .set('Accept', 'application/json, text/event-stream')
+      .send(MCP_INITIALIZE_BODY);
+
+    expect(res.status).toBe(401);
+    expect(res.headers['www-authenticate']).toContain(
+      'resource_metadata="http://localhost:3000/.well-known/oauth-protected-resource/mcp"',
+    );
   });
 
   it('answers 401 for a token whose audience names another server', async () => {

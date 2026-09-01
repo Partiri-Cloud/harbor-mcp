@@ -97,19 +97,54 @@ access before deploying (the probe is authorized against that workspace).`,
   {
     name: 'Scaling & pod sizes',
     uri: 'partiri://docs/deployments/scaling',
-    description: 'Pod sizes, CPU/memory allocation, and billing model',
+    description:
+      'Pod sizes, custom sizing, replica counts, CPU/memory allocation, and billing model',
     content: `# Scaling & Pod Sizes
 
 Services run on pods. You select a pod size when creating a service, which determines the CPU and memory available to your container.
 
+**Pick the cheapest pod that meets the workload's needs.** Use \`list_pods\` for the available sizes and \`get_pricing\` for what each one costs in a region, then start at the smallest size that fits.
+
 - **Smaller pods** — suitable for background workers, lightweight APIs, and static sites
 - **Larger pods** — appropriate for compute-intensive workloads, LLM inference, or services that hold state in memory
 
-You can change the pod size at any time from the service settings page. The change takes effect on the next deployment.
+Scaling up later is a single \`update_service\` call with a new \`fkPod\` (or \`partiri service push\` from the CLI), applied on the next deployment. There is no penalty for starting small.
 
-## Billing
+## Requests vs limits
 
-Pod sizes are billed per second of uptime, so you only pay for what you use. All pod sizes include a fixed allocation of CPU and memory — there is no bursting or shared-CPU throttling.`,
+A catalogue pod publishes two numbers per resource: the **request** (\`cpu_request\`, \`ram_request\`) is what the pod is guaranteed and scheduled against, and the **limit** (\`cpu_limit\`, \`ram_limit\`) is the ceiling it may burst to. \`list_pods\` returns both. A container exceeding its memory limit is OOM-killed; exceeding the CPU limit is throttled, not killed.
+
+A **custom** pod is sized with requests equal to limits — the number you dial in is both what you are guaranteed and what you are billed for, with no burst headroom above it.
+
+## Custom pod sizes
+
+If no catalogue size fits, \`create_service\` accepts \`customPod: { vcpuMillicores, memoryMib }\` instead of \`fkPod\`. Provide exactly one of the two — never both.
+
+Call \`get_custom_pod_options({ regionIds })\` first. It returns the permitted range and the **step grid** values must land on; anything off the grid is rejected. Pass every region the service will run in, since one pod size covers all of them and the offered range is the intersection. \`available: false\` means custom pods cannot be offered for that region set — use a catalogue pod instead.
+
+Custom pods are priced from a rate card, not the catalogue: \`vCPU x price_per_vcpu_month + GB x price_per_gb_ram_month\`, both returned in \`rates\`.
+
+Custom pods are deliberately **absent** from \`list_pods\` and from the default \`get_pricing\` response. To price a service that already runs one, name its \`fk_pod\` in \`get_pricing({ regionId, podIds: [...] })\` — otherwise it comes back unpriced.
+
+## Replicas
+
+\`replicaCount\` is the number of pods run **in each region**. It is not the same thing as the \`replicas\` array on a service, which lists the *regions* the service is deployed to.
+
+Total pods — and the monthly bill — is \`replicaCount x number of regions\`. Changing \`replicaCount\` through \`update_service\` changes billing immediately and enqueues a deploy, so it restarts the workload.
+
+Cronjob and database services always run a single replica.
+
+## Billing — read this before choosing a size
+
+Pod pricing is a **flat monthly rate per size**, charged in full when the service is created and renewed monthly. Actual CPU and memory consumption is never an input to the bill: a pod sitting at 2% utilization costs exactly what the same pod costs at 90%. The rate is charged **per pod**, so a service running two replicas across two regions pays the rate four times.
+
+Choosing a size that costs 12x more than one that would have sufficed costs 12x from day one, and low usage does not recover it. Downsizing later takes effect immediately, but the refund on the already-charged month is prorated by **whole remaining days, rounded up** — the money spent on an oversized first month is largely spent.
+
+### Cronjobs are the exception
+
+A cronjob is **metered, not billed monthly**: nothing is charged at creation and each run is debited on its actual duration (rounded up to the minute, 1-minute floor) at the pod's monthly price divided by 43,200. Everything above about flat monthly pricing does **not** apply to it.
+
+That inverts the sizing advice: because you pay for time actually used, a larger pod that halves the runtime often costs the same or less. See \`partiri://docs/services/cronjob\`.`,
   },
   {
     name: 'Zero-downtime deployments',

@@ -3,9 +3,9 @@ import type { DocResource } from '../index.js';
 /**
  * Documentation resources covering service types and storage: web services,
  * private (internal-only) services, workers (egress-only background
- * processes), static websites, persistent volumes (read-only via MCP,
- * mutations via the `partiri` CLI), and the end-to-end service creation
- * workflow.
+ * processes), cronjobs (metered batch workloads), static websites, persistent
+ * volumes (read-only via MCP, mutations via the `partiri` CLI), and the
+ * end-to-end service creation workflow.
  */
 export const resources: DocResource[] = [
   {
@@ -69,6 +69,80 @@ Deploy from a Git repository (needs a \`run_command\`) or a container registry i
 - **No port, no URL, no health check** — these fields are not applicable and are ignored/rejected for workers.
 - **Runnable target required:** a repository source needs \`run_command\`; a registry source is runnable via its image \`CMD\`/\`ENTRYPOINT\` without one.
 - **Billing:** flat-rate monthly, the same as a web or private service — a worker runs continuously, so it isn't billed per-invocation like a cronjob.`,
+  },
+  {
+    name: 'Cronjob',
+    uri: 'partiri://docs/services/cronjob',
+    description:
+      'Scheduled and one-shot batch workloads — metered per run, not billed monthly',
+    content: `# Cronjob
+
+A cronjob is a batch workload: it starts, does its work, and exits. Use it for nightly reports, cleanup passes, data imports, or any task that runs to completion rather than staying up.
+
+**deploy_type:** \`cronjob\`
+
+## Recurring vs one-shot
+
+\`scheduler\` is the discriminator, and it is the only thing that separates the two:
+
+| \`scheduler\` | Behaviour |
+|---|---|
+| set (e.g. \`'0 3 * * *'\`) | Recurring — a Kubernetes CronJob fires on the schedule |
+| omitted | One-shot — a single Job runs once when deployed |
+
+The expression is standard 5-field cron. **Consecutive runs must be at least 5 minutes apart** — a tighter schedule is rejected. Set \`cronjobTimeZone\` to an IANA name (e.g. \`Europe/Lisbon\`) to pin the schedule to a timezone; without it the schedule is interpreted in the cluster's zone.
+
+## Billing: metered, NOT monthly
+
+**This is the important difference from every other service type.** A cronjob is *never* charged a flat month:
+
+- **Nothing is charged when you create it.** Long-running types (webservice, private-service, worker, static) are charged a full pod month up front. A cronjob is not.
+- **Each run is debited on its actual duration**, rounded up to the whole minute, with a 1-minute floor. A run that takes 12 seconds costs one minute.
+- The per-minute rate is the pod's monthly price divided by 43,200 (30 x 24 x 60). \`get_pricing\` returns it directly as \`perMinute\`.
+
+So a job on a €43.20/month pod costs €0.001/minute. Running nightly for 5 minutes costs about €0.15 a month — not €43.20. **Never quote a cronjob a monthly pod price.** \`create_service\` and \`validate_service\` return a \`cost_estimate\` with \`billing_model: "metered"\` for this type, carrying \`per_minute\` and \`max_cost_per_run\` instead of \`pod_monthly\`.
+
+Because you pay for time actually used, a *bigger* pod is often *cheaper* for a cronjob: double the CPU that halves the runtime costs the same or less. That is the opposite of the trade-off for a long-running service.
+
+## Required fields
+
+- **\`cronjobActiveDeadlineSeconds\` is required** (1–3600). It is the hard kill-timeout for a single run and it is what bounds the worst-case cost of a runaway job. \`create_service\` rejects a cronjob without it.
+- **A runnable target:** a repository source needs \`runCommand\`; a registry source can rely on the image's \`CMD\`/\`ENTRYPOINT\`. Override the entrypoint with \`cronjobCommand\` (argv array) if needed.
+- **Single replica, single region.** A cronjob always runs one replica in one region — metered billing resolves exactly one pod assignment per service, so a second region would go unbilled. \`replicaCount\` must be 1 or omitted.
+
+## Optional tuning
+
+| Field | Purpose |
+|---|---|
+| \`cronjobConcurrencyPolicy\` | \`Allow\` / \`Forbid\` / \`Replace\` — what happens when a run is still going as the next is due. \`Forbid\` is the safe default for jobs that must not overlap. |
+| \`cronjobBackoffLimit\` | Retries before a run counts as failed. |
+| \`cronjobStartingDeadlineSeconds\` | Grace window for a missed slot. Past it, the run is skipped rather than fired late. |
+| \`cronjobTtlSecondsAfterFinished\` | How long a finished run's pod is kept. Keep it long enough to read the logs of a failure. |
+| \`cronjobSuccessfulJobsHistoryLimit\` | Succeeded runs kept in history. |
+| \`cronjobFailedJobsHistoryLimit\` | Failed runs kept in history. |
+
+## Pausing a schedule
+
+Use \`pause_service\` to suspend a recurring cronjob and \`unpause_service\` to resume it. Do **not** try to set the suspend flag through \`update_service\` — it is not accepted there. The API owns that flag and toggles it as part of the pause flow so it stays in step with the metered billing assignment; writing it directly would stop the schedule while billing still treated the service as live.
+
+## Example
+
+\`\`\`
+create_service({
+  name: "nightly-etl",
+  deployType: "cronjob",
+  runtime: "node",
+  rootPath: ".",
+  fkProject, fkRegion, fkPod,
+  repositoryUrl: "https://github.com/org/repo",
+  buildCommand: "npm ci && npm run build",
+  runCommand: "node dist/etl.js",
+  scheduler: "0 3 * * *",
+  cronjobTimeZone: "Europe/Lisbon",
+  cronjobActiveDeadlineSeconds: 900,
+  cronjobConcurrencyPolicy: "Forbid",
+})
+\`\`\``,
   },
   {
     name: 'Static website',
@@ -172,16 +246,23 @@ Before calling \`create_service\`, use \`validate_service\` to catch configurati
 \`\`\`
 validate_service({
   name, deployType, runtime, rootPath,
-  fkRegion, fkPod,
+  fkRegion,
+  fkPod,                // OR customPod — exactly one
+  customPod,            // { vcpuMillicores, memoryMib }; see get_custom_pod_options
+  replicaCount,         // optional; pods per region, scales the estimate
   repositoryUrl,        // or registryUrl
   fkServiceSecret,      // optional; authenticates the reachability probe
   probeReachability: true,
   workspaceId,          // required to probe reachability; also enables balance check
   diskSizeGb,           // optional; included in cost estimate
+  scheduler,            // cronjob only
+  cronjobActiveDeadlineSeconds,  // cronjob only; required for that type
 })
 \`\`\`
 
 Returns \`{ valid, summary, checks[], cost_estimate?, balance_note? }\`.
+
+It accepts every \`deployType\` \`create_service\` does, cronjob included.
 
 ## Creating a service with a private source
 
@@ -191,22 +272,55 @@ Returns \`{ valid, summary, checks[], cost_estimate?, balance_note? }\`.
    \`partiri://docs/configuration/credentials\`.
 2. Call \`create_service\` with \`fkServiceSecret\` set to the credential UUID.
 
-\`create_service\` returns a \`cost_estimate\` when pricing is available:
+## Cost estimate and balance
+
+\`create_service\` and \`validate_service\` return a \`cost_estimate\` when the pod can be priced. **Check \`billing_model\` before reading any other field** — the two shapes are not interchangeable.
+
+Continuously running types (webservice, private-service, worker, static) are billed a flat month per pod, charged up front:
+
 \`\`\`json
 {
-  "pod_monthly": 20.00,
-  "total_monthly": 20.00,
+  "billing_model": "flat_monthly",
+  "pod_unit_monthly": 20.00,
+  "replica_count": 2,
+  "region_count": 1,
+  "pod_monthly": 40.00,
+  "disk_monthly": 1.00,
+  "total_monthly": 41.00,
   "currency": "EUR"
 }
 \`\`\`
 
-## Cost estimate and balance
+\`pod_unit_monthly\` is one pod; \`pod_monthly\` is that times \`replica_count\` times \`region_count\`, because every pod in every region is billed a full month. A volume is a single copy and does not scale with replicas.
 
-- \`get_pricing({ regionId })\` returns pod prices and volume price per GB per month.
+\`pod_monthly\` + \`disk_monthly\` always equals \`total_monthly\`.
+
+A cronjob is metered — nothing is charged at creation and there is no monthly figure for compute:
+
+\`\`\`json
+{
+  "billing_model": "metered",
+  "per_minute": 0.001,
+  "max_cost_per_run": 0.005,
+  "disk_monthly": 10.00,
+  "currency": "EUR",
+  "note": "..."
+}
+\`\`\`
+
+See \`partiri://docs/services/cronjob\`. Do not present \`per_minute\` as a monthly cost.
+\`disk_monthly\` is present whenever the service has a volume — a volume is charged a flat month on
+every deploy type, so on a cronjob it is the *entire* recurring charge.
+
+If the pod cannot be priced, \`cost_estimate\` is **omitted entirely** rather than reported as zero — an absent estimate means unknown, never free.
+
+- \`get_pricing({ regionId, podIds? })\` returns pod prices and volume price per GB per month. The response covers catalogue pods only; name a custom pod's id in \`podIds\` to have it priced too.
 - \`get_balance({ workspaceId })\` returns the workspace balance. Requires \`billing:r\` permission;
   returns \`null\` (not an error) on a 403.
 - A low balance is **informational only**. The API's 402 response is the hard backstop when the
   balance runs out. Check the balance before a large deployment to warn the user proactively.
+  A metered cronjob's compute is not compared against the balance — it costs nothing up front —
+  but an attached volume still is, since that is a real monthly charge.
 
 ## $PORT contract
 

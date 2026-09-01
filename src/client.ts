@@ -241,8 +241,24 @@ export class PartiriApiClient {
    * @param regionId - ID of the region to fetch pricing for.
    * @returns The pricing via `GET /resources/pricing`.
    */
-  getPricing(regionId: string) {
-    return this.get<Pricing>('/resources/pricing', { region: regionId });
+  getPricing(regionId: string, podIds: string[] = []) {
+    // The response covers CATALOGUE pods only. A custom pod is not in it, so
+    // its id has to be named here or it comes back absent and the `?? 0`
+    // fallbacks below quote a paid pod as free.
+    return this.get<Pricing>('/resources/pricing', {
+      region: regionId,
+      ...(podIds.length > 0 ? { pods: podIds.join(',') } : {}),
+    });
+  }
+
+  /**
+   * Slider bounds and rate card for a custom pod across the given regions.
+   * `available: false` means custom pods cannot be offered there.
+   */
+  getCustomPodOptions(regionIds: string[]) {
+    return this.get<CustomPodOptions>('/resources/custom-pod', {
+      regions: regionIds.join(','),
+    });
   }
 
   /**
@@ -580,16 +596,87 @@ export interface Service {
    * `get_service` responses since values may hold secrets.
    */
   env: { key: string; value: string }[] | null;
-  /** Running replicas of this service, or `null` if unset. */
+  /**
+   * Regional deployments of this service, or `null` if unset. These are
+   * REGIONS, not a scale count -- see replica_count.
+   */
   replicas: ServiceReplica[] | null;
+  /**
+   * Pods to run IN EACH region. Total pods is replica_count x replicas.length,
+   * and the workspace is billed one pod month per region per replica.
+   */
+  replica_count: number | null;
+  /**
+   * Cron expression driving a `cronjob` service, or `null`. Presence is the
+   * discriminator: set means a recurring CronJob, absent means a one-shot Job.
+   */
+  scheduler: string | null;
+  /** IANA timezone the schedule is interpreted in, or `null`. */
+  cronjob_time_zone: string | null;
+  /** Hard kill-timeout for a single run, in seconds, or `null`. */
+  cronjob_active_deadline_seconds: number | null;
+  /** Retries before a run counts as failed, or `null`. */
+  cronjob_backoff_limit: number | null;
+  /** Behaviour when a run overruns into the next scheduled one, or `null`. */
+  cronjob_concurrency_policy: 'Allow' | 'Forbid' | 'Replace' | null;
+  /** Seconds a finished run's pod is retained before cleanup, or `null`. */
+  cronjob_ttl_seconds_after_finished: number | null;
+  /** Grace window for starting a missed run, in seconds, or `null`. */
+  cronjob_starting_deadline_seconds: number | null;
+  /** Succeeded runs kept in history, or `null`. */
+  cronjob_successful_jobs_history_limit: number | null;
+  /**
+   * Whether the schedule is suspended, or `null`. READ-ONLY here: the API owns
+   * this flag and toggles it from `pause_service`/`unpause_service`, keeping it
+   * in step with the metered billing assignment. Writing it directly would
+   * stop the schedule while billing still believed the service was live, so
+   * neither create nor update accepts it.
+   */
+  cronjob_suspend: boolean | null;
+  /** Failed runs kept in history, or `null`. */
+  cronjob_failed_jobs_history_limit: number | null;
+  /** Container entrypoint override as argv, or `null`. */
+  cronjob_command: string[] | null;
   /** ISO timestamp of creation, or `null` if unset. */
   created_at: string | null;
   /** ISO timestamp of last update, or `null` if unset. */
   updated_at: string | null;
 }
 
+/**
+ * Batch-workload settings accepted on create and update, shared by both
+ * payloads. Only meaningful when `deploy_type` is `'cronjob'`.
+ *
+ * @remarks
+ * `cronjob_suspend` is deliberately absent: the API owns that flag and drives
+ * it from the pause/unpause job flow so it stays in step with the metered
+ * billing assignment. See {@link Service.cronjob_suspend}.
+ */
+export interface CronjobSettings {
+  /** 5-field cron expression; omit for a one-shot job. */
+  scheduler?: string;
+  /** IANA timezone the schedule is interpreted in. */
+  cronjob_time_zone?: string;
+  /** Hard kill-timeout for a single run, in seconds. Required for cronjobs. */
+  cronjob_active_deadline_seconds?: number;
+  /** Retries before a run counts as failed. */
+  cronjob_backoff_limit?: number;
+  /** Behaviour when a run overruns into the next scheduled one. */
+  cronjob_concurrency_policy?: 'Allow' | 'Forbid' | 'Replace';
+  /** Seconds a finished run's pod is retained before cleanup. */
+  cronjob_ttl_seconds_after_finished?: number;
+  /** Grace window for starting a missed run, in seconds. */
+  cronjob_starting_deadline_seconds?: number;
+  /** Succeeded runs kept in history. */
+  cronjob_successful_jobs_history_limit?: number;
+  /** Failed runs kept in history. */
+  cronjob_failed_jobs_history_limit?: number;
+  /** Container entrypoint override, as argv. */
+  cronjob_command?: string[];
+}
+
 /** Payload for {@link PartiriApiClient.createService}. */
-export interface CreateServicePayload {
+export interface CreateServicePayload extends CronjobSettings {
   /** Service display name. */
   name: string;
   /** Deployment source type (e.g. `'git'`, `'image'`). */
@@ -602,8 +689,18 @@ export interface CreateServicePayload {
   fk_project: string;
   /** ID of the region to deploy into. */
   fk_region: string;
-  /** ID of the pod (compute plan) to use. */
-  fk_pod: string;
+  /**
+   * ID of the pod (compute plan) to use. Optional only because `custom_pod`
+   * replaces it -- exactly one of the two is required.
+   */
+  fk_pod?: string;
+  /**
+   * A custom size instead of a catalogue pod. The server mints (or reuses) a
+   * matching pod class for every region and fills fk_pod in.
+   */
+  custom_pod?: { vcpu_millicores: number; memory_mib: number };
+  /** Pods to run in each region. Defaults to 1. */
+  replica_count?: number;
   /** ID of an associated service secret, if any. */
   fk_service_secret?: string;
   /** Source repository URL, for git-sourced services. */
@@ -625,7 +722,7 @@ export interface CreateServicePayload {
 }
 
 /** Payload for {@link PartiriApiClient.updateService}; all fields optional. */
-export interface UpdateServicePayload {
+export interface UpdateServicePayload extends CronjobSettings {
   /** New service display name. */
   name?: string;
   /** New deployment source type. */
@@ -638,6 +735,10 @@ export interface UpdateServicePayload {
   fk_region?: string;
   /** New pod (compute plan) ID. */
   fk_pod?: string;
+  /** A new custom size; replaces fk_pod, which the server resolves itself. */
+  custom_pod?: { vcpu_millicores: number; memory_mib: number };
+  /** New per-region pod count. */
+  replica_count?: number;
   /** New associated service secret ID. */
   fk_service_secret?: string;
   /** New source repository URL. */
@@ -723,6 +824,24 @@ export interface PodPrice {
 }
 
 /** Pricing information for a region. */
+export interface CustomPodRate {
+  fk_region: string;
+  price_per_vcpu_month: number;
+  price_per_gb_ram_month: number;
+}
+
+/** Bounds a custom pod must sit within, plus the rate it is priced at. */
+export interface CustomPodOptions {
+  available: boolean;
+  min_millicores: number | null;
+  max_millicores: number | null;
+  millicores_step: number | null;
+  min_memory_mib: number | null;
+  max_memory_mib: number | null;
+  memory_mib_step: number | null;
+  rates: CustomPodRate[];
+}
+
 export interface Pricing {
   /** Per-pod pricing. */
   pods: PodPrice[];
