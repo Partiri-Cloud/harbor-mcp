@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A stale or expired `x-api-key` in a client's configuration no longer suppresses
+  OAuth Bearer validation on `/mcp`. The header short-circuited the auth
+  middleware on presence alone, so a client that completed the OAuth flow was
+  rejected on every reconnect while it still sent the old header — and because
+  the rejection was indistinguishable from an expired session, the client
+  re-authenticated and was rejected again. The `Authorization` header is now
+  validated first; `x-api-key` remains the fallback when no Bearer token is
+  present.
+
 ## [0.2.3] — 2026-08-01
 
 ### Fixed

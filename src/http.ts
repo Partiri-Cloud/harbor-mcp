@@ -608,12 +608,17 @@ export function createApp(opts: CreateAppOptions) {
     ).href,
   });
   /**
-   * Accept either a legacy `x-api-key` header or an OAuth Bearer token on
+   * Accept either an OAuth Bearer token or a legacy `x-api-key` header on
    * /mcp requests.
+   * @remarks The `Authorization` header is checked first, and its presence —
+   *   not its validity — decides the path. A client that has completed the
+   *   OAuth flow keeps sending whatever `x-api-key` its config holds, so
+   *   branching on that header instead would skip token validation entirely
+   *   and let a stale key veto a valid token on every reconnect.
    * @param req - The incoming request.
    * @param res - The response, delegated to `bearerAuth` for Bearer
    *   validation.
-   * @param next - Passes control immediately when `x-api-key` is present.
+   * @param next - Passes control on the legacy `x-api-key` path.
    * @returns The result of `next()` (legacy path) or of invoking
    *   `bearerAuth`.
    */
@@ -622,8 +627,9 @@ export function createApp(opts: CreateAppOptions) {
     res: Response,
     next: NextFunction,
   ) => {
+    if (req.headers['authorization']) return bearerAuth(req, res, next);
     if (req.headers['x-api-key']) return next(); // legacy path
-    return bearerAuth(req, res, next); // validates Bearer or returns 401 with WWW-Authenticate
+    return bearerAuth(req, res, next); // returns 401 with WWW-Authenticate
   };
 
   app.use('/mcp', dualAuth);
