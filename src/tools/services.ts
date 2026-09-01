@@ -3,6 +3,14 @@ import type { PartiriApiClient, Service } from '../client.js';
 import { toolResult, toolError } from '../errors.js';
 import type { ToolDefinition, ToolHandler } from './index.js';
 import { READ_ONLY } from './annotations.js';
+import {
+  type CostDelta,
+  type CostEstimate,
+  delta,
+  findPodPrice,
+  quote,
+} from './cost.js';
+import { firstBlockingFailure } from './service-rules.js';
 
 /**
  * Resolve the region a service is primarily deployed in.
@@ -53,7 +61,113 @@ const deployTypeEnum = z.enum([
   'static',
   'private-service',
   'worker',
+  'cronjob',
 ]);
+
+/**
+ * Batch-workload fields, shared by create and update.
+ *
+ * `scheduler` is the discriminator: set it and the service runs as a recurring
+ * CronJob, omit it and it is a one-shot Job. Only meaningful when deployType is
+ * 'cronjob' — the API ignores them otherwise.
+ */
+const cronjobFields = {
+  scheduler: z
+    .string()
+    .optional()
+    .describe(
+      "5-field cron expression, e.g. '0 3 * * *'. Consecutive runs must be at least 5 minutes apart. Omit for a one-shot job.",
+    ),
+  cronjobTimeZone: z
+    .string()
+    .optional()
+    .describe("IANA timezone the schedule runs in, e.g. 'Europe/Lisbon'."),
+  cronjobActiveDeadlineSeconds: z
+    .number()
+    .int()
+    .min(1)
+    .max(3600)
+    .optional()
+    .describe(
+      'Hard kill-timeout for a single run, in seconds (1-3600). REQUIRED for a cronjob: runs are billed per minute of actual duration, and this bounds the worst case.',
+    ),
+  cronjobBackoffLimit: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe('Retries before a run counts as failed.'),
+  cronjobConcurrencyPolicy: z
+    .enum(['Allow', 'Forbid', 'Replace'])
+    .optional()
+    .describe('What to do when a run is still going as the next one is due.'),
+  cronjobCommand: z
+    .array(z.string())
+    .optional()
+    .describe('Container entrypoint override, as argv.'),
+  cronjobTtlSecondsAfterFinished: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "Seconds a finished run's pod is kept before cleanup. Keep it long enough to read the logs of a failed run.",
+    ),
+  cronjobStartingDeadlineSeconds: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      'Grace window for starting a run that missed its slot. Past this, the run is skipped rather than fired late.',
+    ),
+  cronjobSuccessfulJobsHistoryLimit: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe('Succeeded runs kept in history.'),
+  cronjobFailedJobsHistoryLimit: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe('Failed runs kept in history.'),
+};
+
+/**
+ * camelCase tool arg -> snake_case API field, for every batch-workload
+ * setting the MCP accepts.
+ *
+ * `cronjob_suspend` is absent by design: the API owns that flag and toggles it
+ * from the pause/unpause job flow so it stays in step with the metered billing
+ * assignment. Setting it here would halt the schedule while billing still
+ * treated the service as live. Use `pause_service`/`unpause_service` instead.
+ */
+const CRONJOB_FIELD_MAP: Record<string, string> = {
+  scheduler: 'scheduler',
+  cronjobTimeZone: 'cronjob_time_zone',
+  cronjobActiveDeadlineSeconds: 'cronjob_active_deadline_seconds',
+  cronjobBackoffLimit: 'cronjob_backoff_limit',
+  cronjobConcurrencyPolicy: 'cronjob_concurrency_policy',
+  cronjobCommand: 'cronjob_command',
+  cronjobTtlSecondsAfterFinished: 'cronjob_ttl_seconds_after_finished',
+  cronjobStartingDeadlineSeconds: 'cronjob_starting_deadline_seconds',
+  cronjobSuccessfulJobsHistoryLimit: 'cronjob_successful_jobs_history_limit',
+  cronjobFailedJobsHistoryLimit: 'cronjob_failed_jobs_history_limit',
+};
+
+/** Maps the camelCase cronjob args onto their snake_case API fields. */
+function cronjobPayload(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [arg, field] of Object.entries(CRONJOB_FIELD_MAP)) {
+    if (args[arg] !== undefined) out[field] = args[arg];
+  }
+  return out;
+}
+
 /** Allowed values for a service's `runtime` field. */
 const runtimeEnum = z.enum([
   'node',
@@ -107,10 +221,11 @@ export const definitions: ToolDefinition[] = [
     name: 'create_service',
     title: 'Create Service',
     description:
-      'Create a new service in a project. Requires exactly one source (repository URL or registry URL), a compute pod, and a region. Get IDs from list_projects, list_pods, and list_regions. Returns the created service with its id. Supported deploy types: webservice, static, private-service, worker (long-running background process with no inbound network — no port, no URL, no health check); for static the runtime is forced to "static" server-side. Environment variables are NOT set here — manage them with the partiri CLI (see use_partiri_cli).',
+      'Create a new service in a project. Requires exactly one source (repository URL or registry URL), a size (fkPod OR customPod), and a region. Get IDs from list_projects, list_pods, and list_regions. Returns the created service with its id. Supported deploy types: webservice, static, private-service, worker (long-running background process with no inbound network — no port, no URL, no health check), and cronjob (a batch workload: set scheduler for a recurring CronJob, omit it for a one-shot Job; needs run_command or registryUrl, requires cronjobActiveDeadlineSeconds, and always runs a single replica in one region). For static the runtime is forced to "static" server-side. BILLING DIFFERS BY TYPE: every type except cronjob is charged a flat pod month up front per replica per region, while a cronjob is metered — nothing at creation, each run debited on its actual duration. Environment variables are NOT set here — manage them with the partiri CLI (see use_partiri_cli).',
     inputSchema: z.object({
       name: z.string().max(16).describe('Service name (max 16 characters)'),
       deployType: deployTypeEnum.describe('Deployment type'),
+      ...cronjobFields,
       runtime: runtimeEnum.describe('Application runtime'),
       rootPath: z
         .string()
@@ -127,7 +242,35 @@ export const definitions: ToolDefinition[] = [
       fkPod: z
         .string()
         .uuid()
-        .describe('Compute pod UUID (use list_pods to find available pods)'),
+        .optional()
+        .describe(
+          'Compute pod UUID (use list_pods to find available pods). Provide EITHER this or customPod, not both.',
+        ),
+      customPod: z
+        .object({
+          vcpuMillicores: z
+            .number()
+            .int()
+            .positive()
+            .describe('CPU in millicores, e.g. 1000 for one core'),
+          memoryMib: z
+            .number()
+            .int()
+            .positive()
+            .describe('Memory in MiB, e.g. 1024 for one GB'),
+        })
+        .optional()
+        .describe(
+          'A custom size instead of a catalogue pod. Must sit on the step grid returned by get_custom_pod_options; the server rejects anything off it. Requests equal limits, so this is what the service is guaranteed AND billed for.',
+        ),
+      replicaCount: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          'Pods to run IN EACH region (default 1). Total pods, and the monthly bill, is this times the number of regions. Always 1 for cronjob and database services.',
+        ),
       fkServiceSecret: z
         .string()
         .uuid()
@@ -191,6 +334,7 @@ export const definitions: ToolDefinition[] = [
         .optional()
         .describe('Service name (max 16 characters)'),
       deployType: deployTypeEnum.optional().describe('Deployment type'),
+      ...cronjobFields,
       runtime: runtimeEnum.optional().describe('Application runtime'),
       rootPath: z
         .string()
@@ -207,6 +351,23 @@ export const definitions: ToolDefinition[] = [
         .uuid()
         .optional()
         .describe('Compute pod UUID to change the service to'),
+      customPod: z
+        .object({
+          vcpuMillicores: z.number().int().positive(),
+          memoryMib: z.number().int().positive(),
+        })
+        .optional()
+        .describe(
+          'Resize onto a custom size instead of a catalogue pod. Re-send this whenever you change the region set of a service that already runs a custom pod, so the added region gets priced.',
+        ),
+      replicaCount: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          'New per-region pod count. Billing changes immediately and a deploy is enqueued, so this restarts the workload.',
+        ),
       fkServiceSecret: z
         .string()
         .uuid()
@@ -332,17 +493,15 @@ export const handlers: Map<string, ToolHandler> = new Map([
     'create_service',
     async (client: PartiriApiClient, args: Record<string, unknown>) => {
       try {
-        // Exactly one source is required (mirrors validate_service). The API
-        // accepts a sourceless or dual-source body and only fails later at
-        // deploy time, so guard it here.
-        const hasRepo = !!(args.repositoryUrl as string | undefined)?.trim();
-        const hasReg = !!(args.registryUrl as string | undefined)?.trim();
-        if (hasRepo === hasReg) {
+        // Every rule the API would reject, evaluated from the same list
+        // validate_service renders. Sharing the list is what keeps the two
+        // tools from disagreeing about whether a config is acceptable.
+        const failure = firstBlockingFailure(args);
+        if (failure) {
           return toolError(
-            hasRepo
-              ? 'Provide only one source: repositoryUrl OR registryUrl, not both.'
-              : 'A source is required: provide repositoryUrl (git) or registryUrl (container image).',
-            'Use validate_service to preflight the configuration.',
+            failure.message,
+            failure.hint ??
+              'Use validate_service to preflight the full configuration.',
           );
         }
 
@@ -353,7 +512,22 @@ export const handlers: Map<string, ToolHandler> = new Map([
           root_path: args.rootPath as string,
           fk_project: args.fkProject as string,
           fk_region: args.fkRegion as string,
-          fk_pod: args.fkPod as string,
+          fk_pod: args.fkPod as string | undefined,
+          ...(args.customPod
+            ? {
+                custom_pod: {
+                  vcpu_millicores: (
+                    args.customPod as { vcpuMillicores: number }
+                  ).vcpuMillicores,
+                  memory_mib: (args.customPod as { memoryMib: number })
+                    .memoryMib,
+                },
+              }
+            : {}),
+          ...(args.replicaCount !== undefined
+            ? { replica_count: args.replicaCount as number }
+            : {}),
+          ...cronjobPayload(args),
           fk_service_secret: args.fkServiceSecret as string | undefined,
           repository_url: args.repositoryUrl as string | undefined,
           repository_branch: args.repositoryBranch as string | undefined,
@@ -365,22 +539,31 @@ export const handlers: Map<string, ToolHandler> = new Map([
           health_check_path: args.healthCheckPath as string | undefined,
         });
 
-        // Attach monthly cost estimate — non-critical, never blocks creation
-        let costEstimate: {
-          pod_monthly: number;
-          total_monthly: number;
-          currency: string;
-        } | null = null;
+        // Attach a cost estimate — non-critical, never blocks creation
+        let costEstimate: CostEstimate | null = null;
         try {
-          const pricing = await client.getPricing(args.fkRegion as string);
-          const podPrice =
-            pricing.pods.find((p) => p.fk_pod === (args.fkPod as string))
-              ?.price ?? 0;
-          costEstimate = {
-            pod_monthly: podPrice,
-            total_monthly: podPrice,
-            currency: 'EUR',
-          };
+          // Price the pod the service ACTUALLY ended up on. For a custom size
+          // that id only exists after creation (the server mints it), and it is
+          // absent from the catalogue response, so it has to be named.
+          const podId = service.fk_pod ?? (args.fkPod as string | undefined);
+          const pricing = await client.getPricing(
+            args.fkRegion as string,
+            podId ? [podId] : [],
+          );
+          // A missing price row means the pod could not be resolved, and quote()
+          // turns that into no estimate at all — absent means unknown, never
+          // free.
+          const price = findPodPrice(pricing.pods, podId);
+          costEstimate = quote({
+            deployType: args.deployType as string | undefined,
+            podMonthly: price ? Number(price.price) : null,
+            perMinute: price?.perMinute,
+            replicaCount: args.replicaCount as number | undefined,
+            regionCount: service.replicas?.length,
+            activeDeadlineSeconds: args.cronjobActiveDeadlineSeconds as
+              | number
+              | undefined,
+          });
         } catch {
           // Pricing fetch is non-critical
         }
@@ -392,7 +575,7 @@ export const handlers: Map<string, ToolHandler> = new Map([
       } catch (e) {
         return toolError(
           (e as Error).message,
-          'Verify the required fields: name, deployType, runtime, rootPath, fkProject, fkRegion, fkPod. Get IDs from list_projects, list_pods, and list_regions.',
+          'Verify the required fields: name, deployType, runtime, rootPath, fkProject, fkRegion, and a size (fkPod or customPod). Get IDs from list_projects, list_pods, and list_regions; get the custom size range from get_custom_pod_options.',
         );
       }
     },
@@ -431,6 +614,19 @@ export const handlers: Map<string, ToolHandler> = new Map([
         if (rest.rootPath !== undefined) updates.root_path = rest.rootPath;
         if (rest.fkRegion !== undefined) updates.fk_region = rest.fkRegion;
         if (rest.fkPod !== undefined) updates.fk_pod = rest.fkPod;
+        if (rest.customPod !== undefined) {
+          const cp = rest.customPod as {
+            vcpuMillicores: number;
+            memoryMib: number;
+          };
+          updates.custom_pod = {
+            vcpu_millicores: cp.vcpuMillicores,
+            memory_mib: cp.memoryMib,
+          };
+        }
+        if (rest.replicaCount !== undefined)
+          updates.replica_count = rest.replicaCount;
+        Object.assign(updates, cronjobPayload(rest));
         if (rest.fkServiceSecret !== undefined)
           updates.fk_service_secret = rest.fkServiceSecret;
         if (rest.repositoryUrl !== undefined)
@@ -452,23 +648,41 @@ export const handlers: Map<string, ToolHandler> = new Map([
           updates.maintenance_mode = maintenanceMode;
 
         // Compute cost delta before updating — non-critical
-        let costDelta: {
-          current_monthly: number;
-          new_monthly: number;
-          delta_monthly: number;
-          currency: string;
-        } | null = null;
+        let costDelta: CostDelta | null = null;
 
         const newPodId = rest.fkPod as string | undefined;
         const newRegionId = rest.fkRegion as string | undefined;
+        const newReplicaCount = rest.replicaCount as number | undefined;
+        const newDeployType = rest.deployType as string | undefined;
 
-        if (newPodId || newRegionId) {
+        // deployType belongs here alongside the others: switching to or from a
+        // cronjob flips the whole billing model, which is the largest change
+        // this tool can make and used to go unreported entirely.
+        //
+        // A custom resize is still deliberately NOT quoted: the new pod class
+        // does not exist until the update runs, so there is no id to price. The
+        // caller gets the change without a delta rather than a fabricated one.
+        if (
+          (newPodId ||
+            newRegionId ||
+            newReplicaCount !== undefined ||
+            newDeployType !== undefined) &&
+          rest.customPod === undefined
+        ) {
           try {
             const service = await client.getService(serviceId as string);
             const currentRegionId = primaryRegionId(service);
             const currentPodId = service.fk_pod;
             const effectiveNewRegionId = newRegionId ?? currentRegionId;
             const effectiveNewPodId = newPodId ?? currentPodId;
+            const currentReplicas = Math.max(1, service.replica_count ?? 1);
+            const effectiveReplicas = Math.max(
+              1,
+              newReplicaCount ?? currentReplicas,
+            );
+            // Region count is unchanged by this tool — it only moves the
+            // primary — so it scales both sides equally.
+            const regionCount = Math.max(1, service.replicas?.length ?? 1);
 
             if (
               currentRegionId &&
@@ -476,26 +690,45 @@ export const handlers: Map<string, ToolHandler> = new Map([
               effectiveNewRegionId &&
               effectiveNewPodId
             ) {
+              // Both ids are named so a service already on a custom pod is
+              // priced rather than falling through to 0.
               const [currentPricing, newPricing] = await Promise.all([
-                client.getPricing(currentRegionId),
+                client.getPricing(currentRegionId, [currentPodId]),
                 currentRegionId === effectiveNewRegionId
                   ? Promise.resolve(null)
-                  : client.getPricing(effectiveNewRegionId),
+                  : client.getPricing(effectiveNewRegionId, [
+                      effectiveNewPodId,
+                    ]),
               ]);
               const resolvedNewPricing = newPricing ?? currentPricing;
-              const currentPodPrice =
-                currentPricing.pods.find((p) => p.fk_pod === currentPodId)
-                  ?.price ?? 0;
-              const newPodPrice =
-                resolvedNewPricing.pods.find(
-                  (p) => p.fk_pod === effectiveNewPodId,
-                )?.price ?? 0;
-              costDelta = {
-                current_monthly: currentPodPrice,
-                new_monthly: newPodPrice,
-                delta_monthly: newPodPrice - currentPodPrice,
-                currency: 'EUR',
-              };
+              const currentPrice = findPodPrice(
+                currentPricing.pods,
+                currentPodId,
+              );
+              const newPrice = findPodPrice(
+                resolvedNewPricing.pods,
+                effectiveNewPodId,
+              );
+
+              // Each side is quoted from ITS OWN deploy type, then diffed.
+              // Deriving the current side from the NEW type is what reported a
+              // cronjob as already paying a month it never paid.
+              costDelta = delta(
+                quote({
+                  deployType: service.deploy_type,
+                  podMonthly: currentPrice ? Number(currentPrice.price) : null,
+                  perMinute: currentPrice?.perMinute,
+                  replicaCount: currentReplicas,
+                  regionCount,
+                }),
+                quote({
+                  deployType: newDeployType ?? service.deploy_type,
+                  podMonthly: newPrice ? Number(newPrice.price) : null,
+                  perMinute: newPrice?.perMinute,
+                  replicaCount: effectiveReplicas,
+                  regionCount,
+                }),
+              );
             }
           } catch {
             // Cost delta is non-critical — skip on any error

@@ -125,11 +125,11 @@ The protected-resource metadata (RFC 9728) is served at both `/.well-known/oauth
 | `get_current_user` | Get the authenticated user's profile |
 | `list_projects` | List projects in a workspace |
 | `create_project` | Create a new project |
-| `list_pods` | List available compute pods |
+| `list_pods` | List available compute pods (catalogue only; custom sizes are excluded) |
 | `list_regions` | List available deployment regions |
 | `list_services` | List services in a project |
 | `get_service` | Get service details |
-| `create_service` | Create a new service |
+| `create_service` | Create a new service (`webservice`, `static`, `private-service`, `worker`, or `cronjob`) |
 | `update_service` | Update service configuration |
 | `validate_service` | Preflight-validate a service config; optionally probe repo/registry reachability (needs `workspaceId`) |
 | `deploy_service` | Trigger a new deployment |
@@ -141,9 +141,31 @@ The protected-resource metadata (RFC 9728) is served at both `/.well-known/oauth
 | `get_cpu_metrics` | Get CPU usage metrics |
 | `get_memory_metrics` | Get memory usage metrics |
 | `get_network_metrics` | Get network metrics |
-| `get_pricing` | Get pod and volume pricing for a region |
+| `get_pricing` | Get pod and volume pricing for a region (pass `podIds` to price a custom pod too) |
+| `get_custom_pod_options` | Get the CPU/memory range, step grid, and rate card for a custom-sized pod |
 | `get_balance` | Get a workspace's billing balance |
 | `use_partiri_cli` | Advisory guidance for running the `partiri` CLI yourself for sensitive, CLI-only operations |
+
+### Deploy types and billing
+
+Long-running types (`webservice`, `static`, `private-service`, `worker`) are billed a
+**flat monthly rate per pod**, charged up front — total pods being `replicaCount` times
+the number of regions.
+
+A `cronjob` is **metered instead**: nothing is charged at creation, and each run is
+debited on its actual duration (rounded up to the minute, 1-minute floor). An attached
+volume is still charged a flat month on either model, so `disk_monthly` appears on both.
+
+Cost objects returned by `create_service` and `validate_service` carry a `billing_model`
+discriminator (`flat_monthly` or `metered`); `update_service`'s `cost_delta` carries
+`current_billing_model` and `new_billing_model`, so a delta stays meaningful across a
+switch — converting a cronjob to a long-running type reports the full monthly charge it
+starts paying, not zero. A cost object is omitted entirely when it cannot be computed;
+absent means unknown, never free.
+
+Suspending a recurring cronjob's schedule is done with `pause_service` /
+`unpause_service`, not through `update_service` — the API owns that flag and keeps it in
+step with the metered billing assignment.
 
 ### CLI-only operations
 
@@ -187,7 +209,9 @@ src/
     workspaces.ts       Workspace tools
     user.ts             User tools
     projects.ts         Project tools
-    resources.ts        Pod, region, pricing, and balance tools
+    resources.ts        Pod, region, pricing, custom-pod, and balance tools
+    cost.ts             Shared cost math — decides flat monthly vs metered
+    service-rules.ts    Shared create/validate rules (blocking vs advisory)
     services.ts         Service CRUD tools
     validate.ts         validate_service preflight tool (SSRF-guarded reachability probe)
     deployments.ts      Deploy, pause, unpause, and job-list tools

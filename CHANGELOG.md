@@ -22,6 +22,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path already emitted. Without it a rejected client had no way to discover the
   authorization server from the response.
 
+## [0.3.0] — 2026-08-25
+
+### Added
+
+- Cronjob services. `create_service` and `update_service` accept
+  `deployType: 'cronjob'` — a batch workload that runs to completion rather than
+  staying up. `scheduler` is the discriminator: set it for a recurring CronJob,
+  omit it for a one-shot Job. Also accepted: `cronjobTimeZone`,
+  `cronjobActiveDeadlineSeconds`, `cronjobBackoffLimit`,
+  `cronjobConcurrencyPolicy`, `cronjobCommand`, `cronjobStartingDeadlineSeconds`,
+  `cronjobTtlSecondsAfterFinished`, `cronjobSuccessfulJobsHistoryLimit`, and
+  `cronjobFailedJobsHistoryLimit`.
+
+  A cronjob is **metered, not billed monthly** — nothing is charged at creation
+  and each run is debited on its actual duration, rounded up to the minute at the
+  pod's monthly price divided by 43,200. A nightly five-minute job on a €43.20
+  pod costs roughly €0.15 a month, so its cost estimate reports a per-minute rate
+  rather than a monthly one. `cronjobActiveDeadlineSeconds` is required because it
+  bounds the worst-case cost of a run, and a cronjob always runs a single replica
+  in one region.
+
+  Suspending a schedule is deliberately **not** an `update_service` field: the API
+  owns that flag and drives it from `pause_service` / `unpause_service` so it stays
+  in step with the metered billing assignment. It is readable on `get_service`.
+
+  A new `partiri://docs/services/cronjob` resource documents the type, and the
+  service-fields and scaling resources cover the new fields.
+- Custom pod sizes. `create_service` and `update_service` accept
+  `customPod: { vcpuMillicores, memoryMib }` in place of `fkPod`, and a new
+  `get_custom_pod_options` tool returns the permitted range, the step grid values
+  must land on, and the rate card they are priced from. `get_pricing` gained a
+  `podIds` parameter, since the bulk response covers catalogue pods only and a
+  custom pod would otherwise come back unpriced.
+- `replicaCount` on `create_service` and `update_service` — pods to run in each
+  region. Total pods, and the monthly bill, is this times the number of regions.
+
+### Changed
+
+- **Cost objects have a new shape.** Every estimate now carries a
+  `billing_model` discriminator (`flat_monthly` or `metered`), because the two
+  models share no numeric fields and a caller must branch before reading any.
+  A flat estimate reports `pod_unit_monthly` (one pod) alongside `pod_monthly`
+  (that times `replica_count` times `region_count`); previously there was only
+  an ambiguous `pod_monthly`. A metered estimate reports `per_minute` and
+  `max_cost_per_run` instead, and `disk_monthly` appears on both — an attached
+  volume is charged a flat month on any deploy type, so on a cronjob it is the
+  entire recurring charge.
+- **`update_service`'s `cost_delta` has a new shape** and now also fires when
+  `deployType` changes, not only the pod, region, or replica count. It carries
+  `current_billing_model` and `new_billing_model` so a delta stays meaningful
+  when the model itself switches: converting a cronjob to a long-running service
+  reports the full monthly charge it starts paying, and converting one away
+  reports the saving, each with a `note` explaining the switch. Per-minute rates
+  appear for whichever side is metered.
+- The `validate_service` workspace-balance warning is compared against the
+  **recurring** monthly charge. A metered workload no longer raises a false alarm
+  over compute it is never billed for up front, while an attached volume is still
+  checked.
+
+### Fixed
+
+- Cost estimates reported an unpriceable pod as **free**. A pod missing from the
+  pricing response fell through a `?? 0` and was quoted at €0.00 in
+  `create_service`, `update_service`, and `validate_service` alike. The estimate
+  is now omitted entirely — absent means unknown, never free.
+- `validate_service`'s cost estimate was not rounded to cents:
+  `total_monthly` was a raw `podPrice + diskMonthly` sum, so ordinary prices could
+  surface floating-point noise like `10.299999999999999`. Every component is now
+  rounded once, and the total is the sum of the rounded parts, so what a caller
+  reads always adds up.
+- The `partiri://docs/deployments/scaling` resource claimed pods had "a fixed
+  allocation of CPU and memory — there is no bursting". Catalogue pods publish a
+  request and a separate, higher limit, which `list_pods` returns as
+  `cpu_request`/`cpu_limit` and `ram_request`/`ram_limit`. The resource now
+  distinguishes the two and notes that a custom pod's requests equal its limits.
+  It also stated the flat monthly rate was charged per region replica, which
+  understated a service running several replicas per region; it is charged per
+  pod.
+
+### Internal
+
+- The billing-model decision lives in one place (`src/tools/cost.ts`): call sites
+  pass facts to `quote()` and diff two quotes with `delta()` rather than each
+  branching on deploy type.
+- `create_service` and `validate_service` evaluate one shared rule list
+  (`src/tools/service-rules.ts`), each rule marked blocking (mirrors something
+  the API rejects, so `create_service` refuses) or advisory (stricter than the
+  API, so only `validate_service` reports it). A property test asserts
+  `validate_service` never reports a config valid that `create_service` would
+  block, so the preflight cannot drift from the operation it previews.
+
 ## [0.2.3] — 2026-08-01
 
 ### Fixed

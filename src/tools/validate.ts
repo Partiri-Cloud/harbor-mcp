@@ -3,6 +3,13 @@ import type { PartiriApiClient } from '../client.js';
 import { toolResult } from '../errors.js';
 import type { ToolDefinition, ToolHandler } from './index.js';
 import { isPublicHttpUrl, isPrivateOrSpecialHost } from '../net-guard.js';
+import {
+  type CostEstimate,
+  findPodPrice,
+  quote,
+  recurringMonthly,
+} from './cost.js';
+import { serviceRules } from './service-rules.js';
 
 /** Allowed `deploy_type` values for a service. */
 const deployTypeEnum = z.enum([
@@ -10,6 +17,7 @@ const deployTypeEnum = z.enum([
   'static',
   'private-service',
   'worker',
+  'cronjob',
 ]);
 
 /** Allowed `runtime` values for a service. */
@@ -76,7 +84,41 @@ export const definitions: ToolDefinition[] = [
       runtime: runtimeEnum.describe('Application runtime'),
       rootPath: z.string().describe('Application root path'),
       fkRegion: z.string().uuid().describe('Region UUID'),
-      fkPod: z.string().uuid().describe('Compute pod UUID'),
+      fkPod: z
+        .string()
+        .uuid()
+        .optional()
+        .describe('Compute pod UUID. Provide EITHER this or customPod.'),
+      customPod: z
+        .object({
+          vcpuMillicores: z.number().int().positive(),
+          memoryMib: z.number().int().positive(),
+        })
+        .optional()
+        .describe(
+          'A custom size instead of a catalogue pod. Priced from the region rate card, since no pod class exists until the service is created.',
+        ),
+      replicaCount: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe('Pods per region (default 1). Scales the cost estimate.'),
+      scheduler: z
+        .string()
+        .optional()
+        .describe(
+          "Cron expression for a 'cronjob' deployType. Set means recurring, omitted means one-shot.",
+        ),
+      cronjobActiveDeadlineSeconds: z
+        .number()
+        .int()
+        .min(1)
+        .max(3600)
+        .optional()
+        .describe(
+          "Hard kill-timeout for a single run (1-3600). Required for a 'cronjob'; also bounds the per-run cost estimate.",
+        ),
       workspaceId: z
         .string()
         .uuid()
@@ -131,18 +173,20 @@ export const definitions: ToolDefinition[] = [
 
 /**
  * Run the synchronous, local preflight checks for a service configuration:
- * required fields, name length, source XOR rule (repository vs registry),
- * deploy_type/runtime compatibility, and build/run command requirements.
+ * required fields and name length, then every rule in {@link serviceRules} —
+ * source XOR, size XOR, deploy_type compatibility, the cronjob constraints,
+ * and the build/run command requirements.
  *
  * @param args - Raw tool input arguments (unvalidated beyond the Zod schema).
  * @returns The list of validation checks with their pass/fail status.
  * @remarks
- * `build_command` / `run_command` checks here are MCP-side guidance and are
+ * The `build_command` / `run_command` rules are MCP-side guidance and are
  * STRICTER than the API — the backend does not require them for
  * webservice/static/private-service (cronjobs and workers require
- * `run_command || registry_url`). They are surfaced because a repo-sourced
- * service that omits them generally won't build or start; treat a failure
- * here as advisory, not an API rejection.
+ * `run_command || registry_url`). They carry `blocking: false` in the shared
+ * list so `create_service` never refuses on them; treat a failure here as
+ * advisory, not an API rejection. Every other rule mirrors something the API
+ * itself rejects.
  */
 function validateConfig(args: Record<string, unknown>): ValidationCheck[] {
   const checks: ValidationCheck[] = [];
@@ -153,13 +197,11 @@ function validateConfig(args: Record<string, unknown>): ValidationCheck[] {
   };
 
   const name = (args.name as string) ?? '';
-  const deployType = (args.deployType as string) ?? '';
   const rootPath = (args.rootPath as string) ?? '';
-  const repositoryUrl = args.repositoryUrl as string | undefined;
-  const registryUrl = args.registryUrl as string | undefined;
-  const buildCommand = args.buildCommand as string | undefined;
-  const runCommand = args.runCommand as string | undefined;
 
+  // Presence checks the shared rules deliberately leave out: these are shape
+  // requirements the Zod schema already enforces for create_service, so they
+  // are only meaningful here, where callers probe a partial config.
   check('name', name.length > 0, 'Service name is required');
   check(
     'name_length',
@@ -167,45 +209,13 @@ function validateConfig(args: Record<string, unknown>): ValidationCheck[] {
     'Service name must be 16 characters or fewer',
   );
   check('fk_region', !!(args.fkRegion as string), 'Region is required');
-  check('fk_pod', !!(args.fkPod as string), 'Compute pod is required');
   check('root_path', rootPath.length > 0, 'root_path is required');
 
-  const hasRepo = !!repositoryUrl?.trim();
-  const hasReg = !!registryUrl?.trim();
-  check(
-    'source',
-    hasRepo !== hasReg,
-    hasRepo && hasReg
-      ? 'Cannot have both repository_url and registry_url'
-      : 'Either repository_url or registry_url is required',
-  );
-
-  if (deployType === 'static' && hasReg) {
-    check(
-      'deploy_type/static',
-      false,
-      "deploy_type 'static' only supports repository source (not registry)",
-    );
-  }
-
-  if (hasRepo) {
-    check(
-      'build_command',
-      !!buildCommand?.trim(),
-      'build_command is required for repository-sourced services',
-    );
-
-    if (
-      deployType === 'webservice' ||
-      deployType === 'private-service' ||
-      deployType === 'worker'
-    ) {
-      check(
-        'run_command',
-        !!runCommand?.trim(),
-        'run_command is required for webservice, private-service, and worker deploy types',
-      );
-    }
+  // Everything create_service blocks on, evaluated from the same list it uses.
+  // Rendering the shared rules rather than re-implementing them is what stops
+  // this tool from reporting a config valid that create_service then refuses.
+  for (const rule of serviceRules(args)) {
+    check(rule.field, rule.ok, rule.message);
   }
 
   return checks;
@@ -354,30 +364,64 @@ export const handlers: Map<string, ToolHandler> = new Map([
       const failed = allChecks.filter((c) => !c.ok).length;
 
       // Cost estimate — fetch pricing for the region
-      let costEstimate: {
-        pod_monthly: number;
-        disk_monthly: number;
-        total_monthly: number;
-        currency: string;
-      } | null = null;
+      let costEstimate: CostEstimate | null = null;
       let balanceNote: string | null = null;
 
       const fkRegion = args.fkRegion as string | undefined;
       const fkPod = args.fkPod as string | undefined;
+      const customPod = args.customPod as
+        | { vcpuMillicores: number; memoryMib: number }
+        | undefined;
 
-      if (fkRegion && fkPod) {
+      if (fkRegion && (fkPod || customPod)) {
         try {
-          const pricing = await client.getPricing(fkRegion);
-          const podPrice =
-            pricing.pods.find((p) => p.fk_pod === fkPod)?.price ?? 0;
+          // A custom size has no pod id yet -- the class is minted on create --
+          // so price it from the region's rate card instead of the catalogue.
+          // `null` (not 0) when it cannot be priced: quoting an unpriceable pod
+          // as free is worse than returning no estimate at all.
+          let podPrice: number | null = null;
+          if (customPod) {
+            const options = await client.getCustomPodOptions([fkRegion]);
+            const rate = options.rates?.find((r) => r.fk_region === fkRegion);
+            if (rate) {
+              podPrice =
+                Math.round(
+                  ((customPod.vcpuMillicores / 1000) *
+                    Number(rate.price_per_vcpu_month) +
+                    (customPod.memoryMib / 1024) *
+                      Number(rate.price_per_gb_ram_month)) *
+                    100,
+                ) / 100;
+            }
+          }
+
+          // Named explicitly so a catalogue pod AND an already-minted custom
+          // one both resolve; the bulk response carries catalogue pods only.
+          const pricing = await client.getPricing(
+            fkRegion,
+            fkPod ? [fkPod] : [],
+          );
+          const cataloguePrice = findPodPrice(pricing.pods, fkPod);
+          if (fkPod) {
+            podPrice = cataloguePrice ? Number(cataloguePrice.price) : null;
+          }
+
           const diskSizeGb = (args.diskSizeGb as number | undefined) ?? 0;
-          const diskMonthly = pricing.volume_price_per_gb * diskSizeGb;
-          costEstimate = {
-            pod_monthly: podPrice,
-            disk_monthly: diskMonthly,
-            total_monthly: podPrice + diskMonthly,
-            currency: 'EUR',
-          };
+          // The disk is quoted for BOTH billing models: a volume is charged a
+          // flat month on every deploy type, so dropping it for a cronjob
+          // silently discarded a real recurring cost the caller asked about.
+          // validate_service quotes a single region, so region_count is 1.
+          costEstimate = quote({
+            deployType: args.deployType as string | undefined,
+            podMonthly: podPrice,
+            perMinute: cataloguePrice?.perMinute,
+            replicaCount: args.replicaCount as number | undefined,
+            regionCount: 1,
+            diskMonthly: pricing.volume_price_per_gb * diskSizeGb,
+            activeDeadlineSeconds: args.cronjobActiveDeadlineSeconds as
+              | number
+              | undefined,
+          });
         } catch {
           // Pricing fetch is non-critical — skip silently
         }
@@ -387,8 +431,14 @@ export const handlers: Map<string, ToolHandler> = new Map([
       if (workspaceId) {
         try {
           const balance = await client.getBalance(workspaceId);
-          if (costEstimate && balance.amount < costEstimate.total_monthly) {
-            balanceNote = `Warning: workspace balance (${balance.amount} ${balance.currency}) may be insufficient for estimated monthly cost (${costEstimate.total_monthly.toFixed(2)} EUR).`;
+          // Compare against the RECURRING charge, which is the whole monthly
+          // total for a flat service but only the volume for a metered one —
+          // a cronjob's compute is charged nothing up front, so warning on its
+          // pod price would be a false alarm, while an attached volume is a
+          // genuine monthly cost that still deserves the check.
+          const recurring = recurringMonthly(costEstimate);
+          if (recurring > 0 && balance.amount < recurring) {
+            balanceNote = `Warning: workspace balance (${balance.amount} ${balance.currency}) may be insufficient for estimated recurring monthly cost (${recurring.toFixed(2)} EUR).`;
           }
         } catch (e) {
           const msg = (e as Error).message;

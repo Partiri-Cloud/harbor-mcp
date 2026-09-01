@@ -220,7 +220,7 @@ For agents, the canonical machine-readable schema is \`partiri llm schema --json
 | Field | Description |
 |-------|-------------|
 | \`name\` | Display name for your service on Partiri Cloud. |
-| \`deploy_type\` | Service type. One of: \`webservice\` (public HTTP), \`static\` (static hosting, repo only), \`private-service\` (internal), \`worker\` (background process, no inbound network). |
+| \`deploy_type\` | Service type. One of: \`webservice\` (public HTTP), \`static\` (static hosting, repo only), \`private-service\` (internal), \`worker\` (background process, no inbound network), \`cronjob\` (batch workload — recurring when \`scheduler\` is set, one-shot otherwise; metered per run rather than billed monthly). |
 | \`runtime\` | Runtime environment. One of: \`node\`, \`deno\`, \`rust\`, \`python\`, \`go\`, \`ruby\`, \`elixir\`, \`php\`, \`jvm\`, \`dotnet\`, \`cpp\`, \`static\`, \`registry\`. |
 | \`root_path\` | Path to the app root within the repository. Use \`.\` for repo root. Set to a subdirectory for monorepos. |
 | \`repository_url\` | Git repository URL. Mutually exclusive with \`registry_url\`. Required for \`deploy_type: static\`. |
