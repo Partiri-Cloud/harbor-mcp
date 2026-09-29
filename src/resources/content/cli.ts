@@ -157,7 +157,7 @@ You can override the default API URL with \`PARTIRI_API_URL\` and the request ti
 
 The \`.partiri.jsonc\` file is created by \`partiri init\` and read by all CLI commands. It is a JSON5 file — comments (\`//\`) and trailing commas are supported. Edit it by hand and push changes with \`partiri service push\`.
 
-For agents, the canonical machine-readable schema is \`partiri llm schema --json\` (mutual-exclusion and required-field rules included), and the easiest way to discover the UUIDs you need is \`partiri llm context\` (full nested workspace tree in one call). To fill \`fk_workspace\`/\`fk_project\`/\`fk_region\`/\`fk_pod\` interactively or in a single call, prefer \`partiri service link\` over hand-editing.
+For agents, the canonical machine-readable schema is \`partiri llm schema --json\` (mutual-exclusion and required-field rules included), and the easiest way to discover the UUIDs you need is \`partiri llm context\` (full nested workspace tree in one call). To fill \`workspace\`/\`project\`/\`region\`/\`pod\` interactively or in a single call, prefer \`partiri service link\` over hand-editing.
 
 ## Example
 
@@ -167,15 +167,11 @@ For agents, the canonical machine-readable schema is \`partiri llm schema --json
   // Leave as null until you have created the service.
   "id": null,
 
-  // Set by Partiri after each deployment. Required for 'partiri service logs' and metrics.
-  // Run 'partiri service pull' to refresh this value after a new deployment.
-  "deploy_tag": null,
-
   // The workspace this service belongs to (selected during init).
-  "fk_workspace": "uuid",
+  "workspace": "uuid",
 
   // The project this service belongs to (selected during init).
-  "fk_project": "uuid",
+  "project": "uuid",
 
   "service": {
     "name": "my-api",
@@ -187,8 +183,8 @@ For agents, the canonical machine-readable schema is \`partiri llm schema --json
     "build_command": "npm run build",
     "pre_deploy_command": "npm run migrate",
     "run_command": "npm start",
-    "fk_region": "uuid",
-    "fk_pod": "uuid",
+    "region": "uuid",
+    "pod": "uuid",
     "health_check_path": "/health",
     "maintenance_mode": false,
     "active": true
@@ -202,8 +198,8 @@ For agents, the canonical machine-readable schema is \`partiri llm schema --json
 
 - \`service.name\` must be **16 characters or fewer**. Validated locally and rejected by the API.
 - \`repository_url\` and \`registry_url\` are **mutually exclusive** — set exactly one. \`partiri validate\` flags this.
-- \`fk_region\` and \`fk_pod\` must belong to the **same workspace** as \`fk_workspace\`. Cross-workspace UUIDs return 404.
-- Private repositories or registries require \`fk_service_secret\` to be set. Without it, \`partiri validate --remote\` fails on the source-reachability check. Create the secret with \`partiri secret create-repository\` / \`create-registry\` (or in the dashboard), then attach it with \`partiri service token --secret <UUID>\`.
+- \`region\` and \`pod\` must belong to the **same workspace** as \`workspace\`. Cross-workspace UUIDs return 404.
+- Private repositories or registries require \`service_secret\` to be set. Without it, \`partiri validate --remote\` fails on the source-reachability check. Create the secret with \`partiri secret create-repository\` / \`create-registry\` (or in the dashboard), then attach it with \`partiri service token --secret <UUID>\`.
 - \`health_check_path\` accepts either a path (\`/health\`) or an absolute URL. Only absolute URLs are probed by \`partiri validate --remote\`; relative paths are deferred to runtime.
 
 ## Top-level fields
@@ -211,9 +207,8 @@ For agents, the canonical machine-readable schema is \`partiri llm schema --json
 | Field | Description |
 |-------|-------------|
 | \`id\` | Service ID assigned by Partiri after \`partiri service create\`. Null until then — do not set manually. |
-| \`deploy_tag\` | Set by Partiri after each deployment. Required for logs and metrics. Refresh with \`partiri service pull\`. |
-| \`fk_workspace\` | The workspace this service belongs to (selected during \`partiri init\`). |
-| \`fk_project\` | The project this service belongs to (selected during \`partiri init\`). |
+| \`workspace\` | The workspace this service belongs to (selected during \`partiri init\`). |
+| \`project\` | The project this service belongs to (selected during \`partiri init\`). |
 
 ## Service object fields
 
@@ -226,13 +221,13 @@ For agents, the canonical machine-readable schema is \`partiri llm schema --json
 | \`repository_url\` | Git repository URL. Mutually exclusive with \`registry_url\`. Required for \`deploy_type: static\`. |
 | \`repository_branch\` | Branch to deploy. |
 | \`registry_url\` | Full container image reference (e.g. \`ghcr.io/owner/image:tag\`). The API splits host, repository, and tag server-side. Use instead of \`repository_url\` for Docker images. Not supported for \`static\`. |
-| \`fk_service_secret\` | Authentication token for private repository or registry access. Set via \`partiri service token\`. |
+| \`service_secret\` | Authentication token for private repository or registry access. Set via \`partiri service token\`. |
 | \`build_command\` | Command to build the project. Leave empty if not needed. |
 | \`build_path\` | Output directory of the build step (e.g. \`dist\`). Required for \`deploy_type: static\`. |
 | \`pre_deploy_command\` | Runs before each deployment, after build and before start (e.g. database migrations). |
 | \`run_command\` | Command to start the service at runtime. Not used for \`deploy_type: static\`. |
-| \`fk_region\` | Region where the service will be deployed. |
-| \`fk_pod\` | Compute pod — determines CPU and RAM allocated to the service. |
+| \`region\` | Region where the service will be deployed. |
+| \`pod\` | Compute pod — determines CPU and RAM allocated to the service. |
 | \`health_check_path\` | HTTP path polled to verify service health (e.g. \`/health\`). Must return HTTP 200. Set to null to disable. |
 | \`maintenance_mode\` | When true, serves a maintenance page instead of routing traffic to your app. |
 | \`active\` | Whether the service is active. |
