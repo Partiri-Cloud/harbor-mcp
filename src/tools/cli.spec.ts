@@ -67,4 +67,13 @@ describe('use_partiri_cli tool', () => {
     expect(text).toContain('rotate a workspace secret');
     expect(text).toContain('partiri llm guide');
   });
+
+  it('lists the GitHub CLI-only areas', async () => {
+    const text = resultText(
+      await handler(client, { action: 'connect GitHub' }),
+    );
+    expect(text).toContain('partiri service github connect|disconnect');
+    expect(text).toContain('partiri service previews enable|disable');
+    expect(text).toContain('partiri github setup');
+  });
 });

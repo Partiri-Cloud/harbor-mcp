@@ -1,6 +1,10 @@
 import { z } from 'zod';
-import type { PartiriApiClient, Service } from '../client.js';
-import { toolResult, toolError } from '../errors.js';
+import type {
+  CreateServicePayload,
+  PartiriApiClient,
+  Service,
+} from '../client.js';
+import { PartiriApiError, toolResult, toolError } from '../errors.js';
 import type { ToolDefinition, ToolHandler } from './index.js';
 import { READ_ONLY } from './annotations.js';
 import {
@@ -11,6 +15,7 @@ import {
   quote,
 } from './cost.js';
 import { firstBlockingFailure } from './service-rules.js';
+import { GithubResolveError, resolveRepoAndBranch } from './github.js';
 
 /**
  * Resolve the region a service is primarily deployed in.
@@ -53,6 +58,152 @@ function sanitizeService(
   delete clone.env;
   delete clone.fk_service_secret;
   return clone as Omit<Service, 'env' | 'fk_service_secret'>;
+}
+
+/** How a service's source reads back from `get_service`. */
+interface ServiceSource {
+  kind: 'github_app' | 'repository' | 'registry' | 'database';
+  repo: string | null;
+  branch: string | null;
+  auto_deploy: boolean | null;
+  github_disconnected: boolean;
+  previews_enabled: boolean;
+  is_preview?: true;
+  preview_pr_number?: number | null;
+  parent_service_id?: string;
+}
+
+/** Whether a service clones through the GitHub App. */
+function isAppService(service: Service | undefined): boolean {
+  return service?.github_repo_id != null;
+}
+
+/**
+ * Compute the `source` summary of a service: what it deploys from, and, for a
+ * GitHub App service, whether pushes deploy and whether the App lost access.
+ */
+function sourceSummary(service: Service): ServiceSource {
+  const app = isAppService(service);
+  let kind: ServiceSource['kind'] = 'repository';
+  if (service.deploy_type === 'database') kind = 'database';
+  else if (app) kind = 'github_app';
+  else if (service.registry_url) kind = 'registry';
+  const repoByKind = {
+    github_app: service.github_repo_full_name ?? null,
+    repository: service.repository_url ?? null,
+    registry: null,
+    database: null,
+  };
+  return {
+    kind,
+    repo: repoByKind[kind],
+    branch: service.repository_branch ?? null,
+    auto_deploy: service.auto_deploy ?? null,
+    github_disconnected: !!service.github_disconnected_at,
+    previews_enabled: !!service.previews_enabled,
+    ...(service.fk_parent_service
+      ? {
+          is_preview: true as const,
+          preview_pr_number: service.preview_pr_number ?? null,
+          parent_service_id: service.fk_parent_service,
+        }
+      : {}),
+  };
+}
+
+const SOURCE_CLI_HINT =
+  'Changing the source of a GitHub App service is CLI-only: `partiri service github connect` (another repository) or `partiri service github disconnect` (back to a token or anonymous clone). Call use_partiri_cli for guidance.';
+
+/**
+ * Refusal for an update that would change the source of a service it must not.
+ *
+ * @returns The error to return, or `null` when the update may proceed.
+ */
+function sourceUpdateRefusal(
+  service: Service | undefined,
+  args: Record<string, unknown>,
+): ReturnType<typeof toolError> | null {
+  if (!service) return null;
+  if (service.fk_parent_service) {
+    return toolError(
+      `This service is a preview of pull request #${service.preview_pr_number ?? '?'}. It's managed by its parent service and the pull request: change the parent (${service.fk_parent_service}) instead.`,
+    );
+  }
+  if (!isAppService(service)) return null;
+  if (args.repositoryUrl !== undefined) {
+    return toolError(
+      "The repository of a GitHub App service is fixed; repositoryUrl can't be changed here.",
+      SOURCE_CLI_HINT,
+    );
+  }
+  if (args.fkServiceSecret !== undefined) {
+    return toolError(
+      "GitHub App services don't use an access token; fkServiceSecret is not used.",
+      SOURCE_CLI_HINT,
+    );
+  }
+  if (args.registryUrl !== undefined) {
+    return toolError(
+      'This service deploys from GitHub; registryUrl is not allowed.',
+      SOURCE_CLI_HINT,
+    );
+  }
+  return null;
+}
+
+/** Whether an update names a field that can change where the code comes from. */
+function touchesSource(args: Record<string, unknown>): boolean {
+  return (
+    args.repositoryUrl !== undefined ||
+    args.fkServiceSecret !== undefined ||
+    args.registryUrl !== undefined ||
+    args.repositoryBranch !== undefined
+  );
+}
+
+/** Input of `create_service.github`. */
+interface GithubSourceArgs {
+  repo: string;
+  branch: string;
+}
+
+/**
+ * Resolve a `github` source to the ids the API takes, and the notes to show
+ * with the result. There is no fallback: any failure throws.
+ */
+async function githubSource(
+  client: PartiriApiClient,
+  projectId: string,
+  source: GithubSourceArgs,
+): Promise<{
+  github: NonNullable<CreateServicePayload['github']>;
+}> {
+  const project = await client.getProject(projectId);
+  const resolved = await resolveRepoAndBranch(
+    client,
+    project.fk_workspace,
+    source.repo,
+    source.branch,
+  );
+  return {
+    github: {
+      installation_link_id: resolved.linkId,
+      repo_id: resolved.repo.id,
+      branch: source.branch,
+    },
+  };
+}
+
+/** Note on deploy behaviour attached to a service created from GitHub. */
+function githubCreateNote(
+  source: GithubSourceArgs,
+  autoDeploy: boolean | undefined,
+): string {
+  const first =
+    'The service is not deployed yet: call deploy_service for the first deploy.';
+  return autoDeploy === false
+    ? `${first} auto_deploy is off, so pushes to ${source.branch} will not deploy.`
+    : `${first} After that, every push to ${source.branch} deploys automatically (auto_deploy).`;
 }
 
 /** Allowed values for a service's `deployType` field. */
@@ -185,6 +336,24 @@ const runtimeEnum = z.enum([
   'registry',
 ]);
 
+/** GitHub App source: repository by name, resolved to ids server-side. */
+const githubSchema = z
+  .object({
+    repo: z.string().max(200).describe('Repository as owner/repo'),
+    branch: z.string().min(1).max(255).describe('Branch to deploy from'),
+  })
+  .describe(
+    'Clone through the Partiri GitHub App instead of a token. Mutually exclusive with repositoryUrl, registryUrl and fkServiceSecret; the repository must be reachable by the App (see github_status and list_github_repos). Never falls back to an anonymous or token-based service.',
+  );
+
+/** Whether a push deploys the service. */
+const autoDeploySchema = z
+  .boolean()
+  .optional()
+  .describe(
+    'Deploy automatically on every push to the branch (GitHub App services; defaults to true there).',
+  );
+
 /**
  * Tool definitions for the services domain: `list_services`, `get_service`,
  * `create_service`, and `update_service`.
@@ -211,7 +380,7 @@ export const definitions: ToolDefinition[] = [
     name: 'get_service',
     title: 'Get Service',
     description:
-      'Get full configuration of a service including repository, build commands, region, pod, and deploy tag. Environment variables are omitted from the response — they hold secrets and are managed out-of-band via the partiri CLI (see use_partiri_cli). Use list_services to find service IDs.',
+      'Get full configuration of a service including repository, build commands, region, pod, and deploy tag. Environment variables are omitted from the response — they hold secrets and are managed out-of-band via the partiri CLI (see use_partiri_cli). Use list_services to find service IDs. The `source` field says where the service deploys from (github_app, repository, registry or database), and for a pull-request preview its parent.',
     inputSchema: z.object({
       serviceId: z.string().uuid().describe('The service UUID'),
     }),
@@ -221,7 +390,7 @@ export const definitions: ToolDefinition[] = [
     name: 'create_service',
     title: 'Create Service',
     description:
-      'Create a new service in a project. Requires exactly one source (repository URL or registry URL), a size (fkPod OR customPod), and a region. Get IDs from list_projects, list_pods, and list_regions. Returns the created service with its id. Supported deploy types: webservice, static, private-service, worker (long-running background process with no inbound network — no port, no URL, no health check), and cronjob (a batch workload: set scheduler for a recurring CronJob, omit it for a one-shot Job; needs run_command or registryUrl, requires cronjobActiveDeadlineSeconds, and always runs a single replica in one region). For static the runtime is forced to "static" server-side. BILLING DIFFERS BY TYPE: every type except cronjob is charged a flat pod month up front per replica per region, while a cronjob is metered — nothing at creation, each run debited on its actual duration. Environment variables are NOT set here — manage them with the partiri CLI (see use_partiri_cli).',
+      'Create a new service in a project. Requires exactly one source (repository URL, registry URL, or `github` for the Partiri GitHub App), a size (fkPod OR customPod), and a region. Get IDs from list_projects, list_pods, and list_regions. Returns the created service with its id. Supported deploy types: webservice, static, private-service, worker (long-running background process with no inbound network — no port, no URL, no health check), and cronjob (a batch workload: set scheduler for a recurring CronJob, omit it for a one-shot Job; needs run_command or registryUrl, requires cronjobActiveDeadlineSeconds, and always runs a single replica in one region). For static the runtime is forced to "static" server-side. BILLING DIFFERS BY TYPE: every type except cronjob is charged a flat pod month up front per replica per region, while a cronjob is metered — nothing at creation, each run debited on its actual duration. Environment variables are NOT set here — manage them with the partiri CLI (see use_partiri_cli). With `github` the service is created from a GitHub App repository (no token); it is not deployed on creation, and a failure never falls back to a token-based or anonymous service.',
     inputSchema: z.object({
       name: z.string().max(16).describe('Service name (max 16 characters)'),
       deployType: deployTypeEnum.describe('Deployment type'),
@@ -313,6 +482,8 @@ export const definitions: ToolDefinition[] = [
         .max(512)
         .optional()
         .describe('Health check endpoint path (GET)'),
+      github: githubSchema.optional(),
+      autoDeploy: autoDeploySchema,
     }),
     annotations: {
       readOnlyHint: false,
@@ -404,6 +575,7 @@ export const definitions: ToolDefinition[] = [
         .boolean()
         .optional()
         .describe('Enable/disable maintenance mode'),
+      autoDeploy: autoDeploySchema,
     }),
     annotations: {
       readOnlyHint: false,
@@ -474,6 +646,7 @@ export const handlers: Map<string, ToolHandler> = new Map([
         const result = {
           ...sanitizeService(service),
           fk_region: primaryRegionId(service),
+          source: sourceSummary(service),
         };
         return toolResult(result);
       } catch (e) {
@@ -504,6 +677,11 @@ export const handlers: Map<string, ToolHandler> = new Map([
               'Use validate_service to preflight the full configuration.',
           );
         }
+
+        const githubArgs = args.github as GithubSourceArgs | undefined;
+        const resolved = githubArgs
+          ? await githubSource(client, args.fkProject as string, githubArgs)
+          : undefined;
 
         const service = await client.createService({
           name: args.name as string,
@@ -537,6 +715,10 @@ export const handlers: Map<string, ToolHandler> = new Map([
           pre_deploy_command: args.preDeployCommand as string | undefined,
           run_command: args.runCommand as string | undefined,
           health_check_path: args.healthCheckPath as string | undefined,
+          ...(resolved ? { github: resolved.github } : {}),
+          ...(args.autoDeploy !== undefined
+            ? { auto_deploy: args.autoDeploy as boolean }
+            : {}),
         });
 
         // Attach a cost estimate — non-critical, never blocks creation
@@ -571,8 +753,22 @@ export const handlers: Map<string, ToolHandler> = new Map([
         return toolResult({
           ...sanitizeService(service),
           ...(costEstimate ? { cost_estimate: costEstimate } : {}),
+          ...(resolved && githubArgs
+            ? {
+                github_note: githubCreateNote(
+                  githubArgs,
+                  args.autoDeploy as boolean | undefined,
+                ),
+              }
+            : {}),
         });
       } catch (e) {
+        if (
+          e instanceof GithubResolveError ||
+          (e instanceof PartiriApiError && e.code)
+        ) {
+          return toolError(e.message);
+        }
         return toolError(
           (e as Error).message,
           'Verify the required fields: name, deployType, runtime, rootPath, fkProject, fkRegion, and a size (fkPod or customPod). Get IDs from list_projects, list_pods, and list_regions; get the custom size range from get_custom_pod_options.',
@@ -604,6 +800,13 @@ export const handlers: Map<string, ToolHandler> = new Map([
           return toolError(
             'Provide only one source: repositoryUrl OR registryUrl, not both.',
           );
+        }
+
+        let current: Service | undefined;
+        if (touchesSource(rest)) {
+          current = await client.getService(serviceId as string);
+          const refusal = sourceUpdateRefusal(current, rest);
+          if (refusal) return refusal;
         }
 
         // Map camelCase args to snake_case API fields
@@ -646,6 +849,8 @@ export const handlers: Map<string, ToolHandler> = new Map([
           updates.health_check_path = rest.healthCheckPath;
         if (maintenanceMode !== undefined)
           updates.maintenance_mode = maintenanceMode;
+        if (rest.autoDeploy !== undefined)
+          updates.auto_deploy = rest.autoDeploy;
 
         // Compute cost delta before updating — non-critical
         let costDelta: CostDelta | null = null;
@@ -670,7 +875,8 @@ export const handlers: Map<string, ToolHandler> = new Map([
           rest.customPod === undefined
         ) {
           try {
-            const service = await client.getService(serviceId as string);
+            const service =
+              current ?? (await client.getService(serviceId as string));
             const currentRegionId = primaryRegionId(service);
             const currentPodId = service.fk_pod;
             const effectiveNewRegionId = newRegionId ?? currentRegionId;
@@ -742,6 +948,11 @@ export const handlers: Map<string, ToolHandler> = new Map([
           ...(costDelta ? { cost_delta: costDelta } : {}),
         });
       } catch (e) {
+        // A coded API error (e.g. github_branch_not_found,
+        // github_identity_required) already carries its specific hint.
+        if (e instanceof PartiriApiError && e.code) {
+          return toolError(e.message);
+        }
         return toolError(
           (e as Error).message,
           'Verify the service ID exists and the update values are valid. Use get_service to see current configuration.',

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PartiriApiClient } from './client.js';
+import { PartiriApiError } from './errors.js';
 
 function jsonResponse(
   body: unknown,
@@ -155,6 +156,47 @@ describe('PartiriApiClient', () => {
       );
 
       await expect(client.getService('missing')).rejects.toThrow('Not found');
+    });
+  });
+
+  describe('GitHub routes and error codes', () => {
+    it('throws an error carrying the allowlisted code and status', async () => {
+      fetchMock.mockResolvedValue(
+        jsonResponse(
+          { statusCode: 403, error: 'github_identity_required', message: 'm' },
+          403,
+        ),
+      );
+      const err = await client.getGithubIdentity().catch((e) => e);
+      expect(err).toBeInstanceOf(PartiriApiError);
+      expect(err.code).toBe('github_identity_required');
+      expect(err.status).toBe(403);
+      expect(err.message).toContain('(github_identity_required)');
+    });
+
+    it('builds the repository, branch and detect queries', async () => {
+      fetchMock.mockImplementation(() => Promise.resolve(jsonResponse({})));
+      await client.listGithubRepositories('L', {
+        q: 'a/b',
+        page: 2,
+        perPage: 100,
+        refresh: true,
+      });
+      await client.listGithubBranches(7, 'L');
+      await client.detectGithubRepository(7, 'L', {
+        ref: 'dev',
+        rootPath: 'api',
+      });
+      const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+      expect(urls[0]).toBe(
+        'https://api.example.com/integrations/github/installations/L/repositories?q=a%2Fb&page=2&per_page=100&refresh=1',
+      );
+      expect(urls[1]).toBe(
+        'https://api.example.com/integrations/github/repositories/7/branches?link=L',
+      );
+      expect(urls[2]).toBe(
+        'https://api.example.com/integrations/github/repositories/7/detect?link=L&ref=dev&root_path=api',
+      );
     });
   });
 });

@@ -18,6 +18,8 @@ Every deployment starts the same way: you connect a source, either a Git reposit
 
 We pull your code, build it (if needed), and get it running. Each deployment is tracked, so you can see whether it succeeded or failed and roll things forward with confidence.
 
+Deployments can be queued manually, by a deploy hook, by a rollback, and, for GitHub App services, by a push to the branch (\`autoDeploy\`) or a pull-request preview. \`list_jobs\` reports this as each job's \`trigger\`. See \`partiri://docs/services/github-app\`.
+
 No guessing, no surprises. All deployments run on infrastructure hosted within Europe.`,
   },
   {
@@ -186,6 +188,8 @@ Every deployment is tracked in your service's job history. Each job records the 
 3. Redeploy a previous successful job
 
 A rollback creates a new deployment job using the same source reference as the selected job — it follows the same build and health check process as any other deployment.
+
+For a service that was switched from an access token to the GitHub App, rolling back to a deploy from before the switch still uses the old token, so it only works while that token is valid.
 
 ## From the CLI
 

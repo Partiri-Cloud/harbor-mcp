@@ -7,6 +7,55 @@ import {
   TOOL_RESULT_CHAR_BUDGET,
 } from './errors.js';
 
+describe('parseApiError GitHub codes', () => {
+  async function parse(status: number, body: unknown): Promise<string> {
+    return parseApiError(new Response(JSON.stringify(body), { status }));
+  }
+
+  it('adds the code and its hint instead of the status hint', async () => {
+    const result = await parse(403, {
+      statusCode: 403,
+      error: 'github_identity_required',
+      message: 'No GitHub identity',
+    });
+    expect(result).toContain(
+      'API error 403 (github_identity_required) — No GitHub identity',
+    );
+    expect(result).toContain('Connect your GitHub account first');
+    expect(result).toContain('partiri github setup');
+    expect(result).not.toContain('workspace limit has been reached');
+  });
+
+  it('maps every allowlisted code', async () => {
+    for (const code of [
+      'github_app_disabled',
+      'github_repo_not_accessible',
+      'github_branch_not_found',
+      'github_registry_switch_forbidden',
+      'installation_suspended',
+      'preview_service_managed',
+      'dockerfile_requires_github_app',
+      'github_state_invalid',
+    ]) {
+      const result = await parse(400, { error: code, message: 'm' });
+      expect(result).toContain(`(${code})`);
+      expect(result).not.toContain('Check that your configuration values');
+    }
+  });
+
+  it('ignores the HTTP reason phrase in error and keeps the status hint', async () => {
+    const result = await parse(403, { error: 'Forbidden', message: 'nope' });
+    expect(result).toContain('API error 403 — nope');
+    expect(result).not.toContain('(Forbidden)');
+    expect(result).toContain('may lack permission');
+  });
+
+  it('does not treat inherited object keys as codes', async () => {
+    const result = await parse(400, { error: 'constructor', message: 'x' });
+    expect(result).toContain('API error 400 — x');
+  });
+});
+
 describe('parseApiError', () => {
   it('extracts message from JSON body', async () => {
     const response = new Response(JSON.stringify({ message: 'Not found' }), {

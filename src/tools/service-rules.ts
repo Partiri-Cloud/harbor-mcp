@@ -76,20 +76,51 @@ export function serviceRules(args: Record<string, unknown>): ServiceRule[] {
   const deployType = (args.deployType as string) ?? '';
   const hasRepo = !!(args.repositoryUrl as string | undefined)?.trim();
   const hasRegistry = !!(args.registryUrl as string | undefined)?.trim();
+  const hasGithub = !!args.github;
   const hasPod = !!(args.fkPod as string | undefined);
   const hasCustomPod = !!args.customPod;
 
   // The API accepts a sourceless or dual-source body and only fails later at
-  // deploy time, so the XOR has to be enforced here.
+  // deploy time, so the XOR has to be enforced here. A GitHub App source is a
+  // third way to name the repository, exclusive with the other two.
+  const sourceOk = hasGithub
+    ? !hasRepo && !hasRegistry
+    : hasRepo !== hasRegistry;
+  const sourceMessage = hasGithub
+    ? 'github cannot be combined with repositoryUrl or registryUrl: the GitHub App source names the repository itself.'
+    : hasRepo && hasRegistry
+      ? 'Provide only one source: repositoryUrl OR registryUrl, not both.'
+      : 'A source is required: provide repositoryUrl (git) or registryUrl (container image).';
   rule(
     'source',
-    hasRepo !== hasRegistry,
-    hasRepo && hasRegistry
-      ? 'Provide only one source: repositoryUrl OR registryUrl, not both.'
-      : 'A source is required: provide repositoryUrl (git) or registryUrl (container image).',
+    sourceOk,
+    sourceMessage,
     true,
     'Use validate_service to preflight the configuration.',
   );
+
+  if (hasGithub) {
+    // The server drops fk_service_secret for an App service and rejects the
+    // other source types, so a request that sets them can only mislead.
+    rule(
+      'github_secret',
+      !(args.fkServiceSecret as string | undefined),
+      "GitHub App services don't use an access token: omit fkServiceSecret.",
+      true,
+    );
+    rule(
+      'github_deploy_type',
+      deployType !== 'database' && deployType !== 'registry',
+      'The GitHub App is for repository services; it cannot be used with deployType database or registry.',
+      true,
+    );
+    rule(
+      'github_branch_field',
+      args.repositoryBranch === undefined,
+      'repositoryBranch is ignored with github: set the branch in github.branch.',
+      true,
+    );
+  }
 
   // The API takes custom_pod in place of fk_pod and silently prefers it, so
   // sending both would discard the pod the caller named.
@@ -139,7 +170,7 @@ export function serviceRules(args: Record<string, unknown>): ServiceRule[] {
   // Advisory from here down: stricter than the API, which does not require
   // these for webservice/static/private-service. Surfaced because a repo
   // source that omits them generally will not build or start.
-  if (hasRepo) {
+  if (hasRepo || hasGithub) {
     rule(
       'build_command',
       !!(args.buildCommand as string | undefined)?.trim(),

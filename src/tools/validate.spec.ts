@@ -152,3 +152,138 @@ describe('validate_service SSRF guards', () => {
     }
   });
 });
+
+describe('validate_service GitHub source', () => {
+  const github = { repo: 'acme/widget', branch: 'main' };
+  const cfg = {
+    name: 'svc',
+    deployType: 'webservice',
+    runtime: 'node',
+    rootPath: '.',
+    fkRegion: WORKSPACE_ID,
+    fkPod: WORKSPACE_ID,
+    buildCommand: 'b',
+    runCommand: 'r',
+    github,
+  };
+
+  function ghClient(): PartiriApiClient {
+    return {
+      ...(mockClient() as object),
+      getGithubConfig: vi.fn().mockResolvedValue({ enabled: true }),
+      getProject: vi.fn().mockResolvedValue({ fk_workspace: WORKSPACE_ID }),
+      getGithubIdentity: vi.fn().mockResolvedValue({ connected: true }),
+      listGithubInstallations: vi.fn().mockResolvedValue([
+        {
+          link_id: 'l1',
+          account_login: 'acme',
+          suspended: false,
+          settings_url: 'u',
+        },
+      ]),
+      listGithubRepositories: vi.fn().mockResolvedValue({
+        items: [{ id: 5, full_name: 'acme/widget', archived: false }],
+      }),
+      listGithubBranches: vi
+        .fn()
+        .mockResolvedValue([{ name: 'main', default: true }]),
+    } as unknown as PartiriApiClient;
+  }
+
+  it('is valid when the App reaches the repository and branch', async () => {
+    const result = payload(
+      await handler(ghClient(), { ...cfg, workspaceId: WORKSPACE_ID }),
+    );
+    expect(result.valid).toBe(true);
+    expect(result.checks.map((c) => c.field)).toEqual(
+      expect.arrayContaining(['github_repository', 'github_branch']),
+    );
+  });
+
+  it('fails on a missing branch', async () => {
+    const result = payload(
+      await handler(ghClient(), {
+        ...cfg,
+        github: { ...github, branch: 'nope' },
+        workspaceId: WORKSPACE_ID,
+      }),
+    );
+    const check = result.checks.find((c) => c.field === 'github_branch')!;
+    expect(check.ok).toBe(false);
+    expect(check.message).toContain('main');
+    expect(result.valid).toBe(false);
+  });
+
+  it('requires workspaceId or fkProject for the GitHub check', async () => {
+    const result = payload(await handler(ghClient(), cfg));
+    const check = result.checks.find((c) => c.field === 'github_repository')!;
+    expect(check.ok).toBe(false);
+    expect(check.message).toContain('workspaceId or fkProject is required');
+  });
+
+  it('derives the workspace from fkProject when workspaceId is absent', async () => {
+    const client = ghClient();
+    const result = payload(
+      await handler(client, { ...cfg, fkProject: WORKSPACE_ID }),
+    );
+    expect(result.valid).toBe(true);
+    expect(client.getProject).toHaveBeenCalledWith(WORKSPACE_ID);
+    expect(client.getGithubConfig).toHaveBeenCalledWith(WORKSPACE_ID);
+  });
+
+  it('is invalid when the workspace has the GitHub App disabled', async () => {
+    const client = {
+      ...(ghClient() as object),
+      getGithubConfig: vi.fn().mockResolvedValue({ enabled: false }),
+    } as unknown as PartiriApiClient;
+    const result = payload(
+      await handler(client, { ...cfg, workspaceId: WORKSPACE_ID }),
+    );
+    expect(result.valid).toBe(false);
+    expect(result.checks.find((c) => c.field === 'github_repository')!.ok).toBe(
+      false,
+    );
+  });
+
+  it('is invalid for an archived repository', async () => {
+    const client = {
+      ...(ghClient() as object),
+      listGithubRepositories: vi.fn().mockResolvedValue({
+        items: [{ id: 5, full_name: 'acme/widget', archived: true }],
+      }),
+    } as unknown as PartiriApiClient;
+    const result = payload(
+      await handler(client, { ...cfg, workspaceId: WORKSPACE_ID }),
+    );
+    expect(result.valid).toBe(false);
+    expect(
+      result.checks.find((c) => c.field === 'github_repository')!.message,
+    ).toContain('archived');
+  });
+
+  it('flags github combined with repositoryBranch', async () => {
+    const result = payload(
+      await handler(ghClient(), {
+        ...cfg,
+        repositoryBranch: 'dev',
+        workspaceId: WORKSPACE_ID,
+      }),
+    );
+    expect(result.valid).toBe(false);
+    expect(
+      result.checks.find((c) => c.field === 'github_branch_field')!.ok,
+    ).toBe(false);
+  });
+
+  it('flags github combined with repositoryUrl', async () => {
+    const result = payload(
+      await handler(ghClient(), {
+        ...cfg,
+        repositoryUrl: 'https://github.com/acme/widget',
+        workspaceId: WORKSPACE_ID,
+      }),
+    );
+    expect(result.valid).toBe(false);
+    expect(result.checks.find((c) => c.field === 'source')!.ok).toBe(false);
+  });
+});

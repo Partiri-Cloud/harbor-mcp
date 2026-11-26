@@ -178,7 +178,9 @@ Persistent volumes provide durable storage that survives service restarts. Once 
 ## Mutations — CLI only
 
 Creating, attaching, detaching, deleting, and retrying volumes are **not** MCP
-tools — they are data-affecting or irreversible, so you run them yourself with the
+tools (nor are GitHub source changes — \`partiri service github connect|disconnect\` —
+PR preview settings — \`partiri service previews enable|disable\` — or linking the GitHub
+account — \`partiri github setup\`; see \`partiri://docs/services/github-app\`) — they are data-affecting or irreversible, so you run them yourself with the
 \`partiri\` CLI. The \`use_partiri_cli\` tool does not execute anything; it returns
 guidance for the command to run in your own terminal. Discover the exact
 subcommands and flags at runtime rather than guessing:
@@ -233,6 +235,45 @@ Call \`get_pricing\` with a region UUID to see \`volume_price_per_gb\` (EUR/GB/m
 Use it to estimate a volume's monthly cost before creating it via the CLI.`,
   },
   {
+    name: 'GitHub App services',
+    uri: 'partiri://docs/services/github-app',
+    description:
+      'Deploying from GitHub through the Partiri GitHub App: no token, deploy on push, pull-request previews, and what is CLI-only',
+    content: `# GitHub App Services
+
+A service can clone its repository through the Partiri GitHub App instead of an access token. There is no token to create or rotate, and every push to the branch can deploy automatically.
+
+## Flow
+
+1. **Link GitHub and install the App (dashboard).** The owner of the API key connects their GitHub account and installs the App on the account or organisation that holds the repository: \`<dashboard>/workspace-settings/<workspaceId>\`, GitHub card (or \`partiri github setup\`). The MCP cannot do this.
+2. **Discover.** \`github_status\` shows whether the App is available, whether GitHub is connected (or the authorization expired and must be reconnected), and the installations. \`list_github_repos\`, \`list_github_branches\` and \`detect_service_config\` read repositories, branches and suggested build/run commands.
+3. **Create.** \`create_service\` with \`github: { repo: "owner/repo", branch }\` (instead of \`repositoryUrl\` / \`registryUrl\` / \`fkServiceSecret\`). \`validate_service\` accepts the same input and checks the repository and branch against the App.
+4. **First deploy.** The service is **not deployed on creation**: call \`deploy_service\`.
+5. **Pushes deploy.** From then on every push to the branch deploys (\`autoDeploy\`, default true). Set \`autoDeploy: false\` on \`create_service\` or \`update_service\` to turn it off. \`list_jobs\` shows each job's \`trigger\` (\`github_push\`, \`manual\`, \`deploy_hook\`, \`rollback\`, \`preview\`).
+
+There is **no fallback**: if the repository is not reachable through the App, \`create_service\` fails with the reason. It never creates a token-based or anonymous service instead.
+
+## Constraints
+
+- The repository of a GitHub App service is fixed. \`update_service\` refuses \`repositoryUrl\`, \`fkServiceSecret\` and \`registryUrl\` on it. A branch change is allowed (the API checks it).
+- Not available for databases or registry-image services.
+- \`get_service\` reports \`source.kind\` (\`github_app\`, \`repository\`, \`registry\`, \`database\`), the branch, \`auto_deploy\`, and \`github_disconnected\` (the App lost access: pushes do not deploy and redeploys fail until it is reconnected).
+- Dockerfile builds cannot be created through the MCP.
+
+## Pull-request previews
+
+With previews enabled, each open pull request gets its own preview service (one replica, in the parent's primary region, on the configured pod).
+
+- **Billing:** a preview is created through the normal service path, so a pod month is charged when each preview is created, and unused time is refunded when it is removed (PR closed or merged, or previews turned off). With a low balance no preview is created and the pull request gets a comment.
+- A workspace has a limit on live previews; \`get_service_previews\` shows \`used\` and \`limit\` (\`null\` is unlimited), availability and why not, and each preview (PR number, URL, last job status).
+- A preview is managed by its parent service and the pull request: \`update_service\` refuses it, and \`get_service\` marks it (\`source.is_preview\`).
+- **Enabling or disabling previews is CLI-only:** \`partiri service previews enable|disable\`.
+
+## CLI-only
+
+Connecting or disconnecting an existing service (\`partiri service github connect|disconnect\`), previews (\`partiri service previews enable|disable\`) and linking the GitHub account (\`partiri github setup\`, or the dashboard) are not MCP tools. Use \`use_partiri_cli\` for guidance.`,
+  },
+  {
     name: 'Service creation workflow',
     uri: 'partiri://docs/services/creation-workflow',
     description:
@@ -263,6 +304,10 @@ validate_service({
 Returns \`{ valid, summary, checks[], cost_estimate?, balance_note? }\`.
 
 It accepts every \`deployType\` \`create_service\` does, cronjob included.
+
+## Creating a service from GitHub (no token)
+
+Use \`create_service\` with \`github: { repo, branch }\` instead of \`repositoryUrl\`. See \`partiri://docs/services/github-app\`. \`create_service\` never falls back to a token-based or anonymous service.
 
 ## Creating a service with a private source
 

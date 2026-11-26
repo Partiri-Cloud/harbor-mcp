@@ -1,4 +1,4 @@
-import { parseApiError } from './errors.js';
+import { PartiriApiError, readApiError } from './errors.js';
 
 /**
  * Options for a single HTTP call made via {@link PartiriApiClient.request}.
@@ -78,8 +78,8 @@ export class PartiriApiClient {
     );
 
     if (!response.ok) {
-      const errorMessage = await parseApiError(response);
-      throw new Error(errorMessage);
+      const parsed = await readApiError(response);
+      throw new PartiriApiError(parsed.text, parsed.status, parsed.code);
     }
 
     const text = await response.text();
@@ -195,6 +195,16 @@ export class PartiriApiClient {
    */
   listProjects(workspaceId: string) {
     return this.get<Project[]>('/projects', { workspace: workspaceId });
+  }
+
+  /**
+   * Fetches a single project, e.g. to learn which workspace owns it.
+   *
+   * @param projectId - ID of the project to fetch.
+   * @returns The project via `GET /projects/{projectId}`.
+   */
+  getProject(projectId: string) {
+    return this.get<Project>(`/projects/${projectId}`);
   }
 
   /**
@@ -320,6 +330,113 @@ export class PartiriApiClient {
   // Service deletion is intentionally not exposed here — it is done by running
   // the `partiri` CLI yourself (use_partiri_cli returns guidance), keeping
   // irreversible deletes off the MCP surface.
+
+  // ── GitHub App ────────────────────────────────────────────────────────────
+
+  /**
+   * Whether the GitHub App (and its add-ons) is available for a workspace.
+   *
+   * @returns The flags via `GET /integrations/github/config`.
+   */
+  getGithubConfig(workspaceId: string) {
+    return this.get<GithubConfig>('/integrations/github/config', {
+      workspace: workspaceId,
+    });
+  }
+
+  /**
+   * The GitHub identity linked to the API key's owner (never a token).
+   *
+   * @returns The identity via `GET /integrations/github/me`.
+   */
+  getGithubIdentity() {
+    return this.get<GithubIdentity>('/integrations/github/me');
+  }
+
+  /**
+   * GitHub App installations linked to a workspace.
+   *
+   * @returns The links via `GET /integrations/github/installations`.
+   */
+  listGithubInstallations(workspaceId: string) {
+    return this.get<GithubInstallation[]>(
+      '/integrations/github/installations',
+      {
+        workspace: workspaceId,
+      },
+    );
+  }
+
+  /**
+   * Repositories the App can reach through one installation link.
+   *
+   * @param linkId - `link_id` of the installation.
+   * @param opts - Substring filter, paging, and a cache bypass.
+   * @returns A page via `GET /integrations/github/installations/{linkId}/repositories`.
+   */
+  listGithubRepositories(
+    linkId: string,
+    opts: {
+      q?: string;
+      page?: number;
+      perPage?: number;
+      refresh?: boolean;
+    } = {},
+  ) {
+    const query: Record<string, string> = {};
+    if (opts.q) query.q = opts.q;
+    if (opts.page !== undefined) query.page = String(opts.page);
+    if (opts.perPage !== undefined) query.per_page = String(opts.perPage);
+    if (opts.refresh) query.refresh = '1';
+    return this.get<GithubRepoPage>(
+      `/integrations/github/installations/${linkId}/repositories`,
+      query,
+    );
+  }
+
+  /**
+   * Branches of a repository, default branch first.
+   *
+   * @returns The branches via `GET /integrations/github/repositories/{repoId}/branches`.
+   */
+  listGithubBranches(repoId: number, linkId: string) {
+    return this.get<GithubBranch[]>(
+      `/integrations/github/repositories/${repoId}/branches`,
+      { link: linkId },
+    );
+  }
+
+  /**
+   * Detects runtime and commands for a repository at a ref.
+   *
+   * @returns Candidates via `GET /integrations/github/repositories/{repoId}/detect`.
+   */
+  detectGithubRepository(
+    repoId: number,
+    linkId: string,
+    opts: { ref?: string; rootPath?: string } = {},
+  ) {
+    const query: Record<string, string> = { link: linkId };
+    if (opts.ref) query.ref = opts.ref;
+    if (opts.rootPath) query.root_path = opts.rootPath;
+    return this.get<GithubDetectResult>(
+      `/integrations/github/repositories/${repoId}/detect`,
+      query,
+    );
+  }
+
+  /**
+   * Preview-environment settings, availability and live previews of a service.
+   *
+   * @returns The overview via `GET /services/{serviceId}/previews`.
+   */
+  getServicePreviews(serviceId: string) {
+    return this.get<ServicePreviews>(`/services/${serviceId}/previews`);
+  }
+
+  // Connecting or disconnecting a service's GitHub source, preview settings and
+  // linking the GitHub account are intentionally not exposed here: they are
+  // CLI-only (use_partiri_cli returns guidance).
 
   // ── Resource probes ───────────────────────────────────────────────────────
 
@@ -637,6 +754,22 @@ export interface Service {
   cronjob_failed_jobs_history_limit: number | null;
   /** Container entrypoint override as argv, or `null`. */
   cronjob_command: string[] | null;
+  /** GitHub App installation id; set on GitHub App services. */
+  fk_github_installation?: string | null;
+  /** GitHub repository id; non-null means a GitHub App service. */
+  github_repo_id?: number | null;
+  /** `owner/repo` of a GitHub App service. */
+  github_repo_full_name?: string | null;
+  /** When the App lost access to the repository, if it did. */
+  github_disconnected_at?: string | null;
+  /** Whether a push to the branch deploys the service. */
+  auto_deploy?: boolean | null;
+  /** Parent service id; set on a pull-request preview. */
+  fk_parent_service?: string | null;
+  /** Pull request number of a preview. */
+  preview_pr_number?: number | null;
+  /** Whether PR previews are enabled for this service. */
+  previews_enabled?: boolean | null;
   /** ISO timestamp of creation, or `null` if unset. */
   created_at: string | null;
   /** ISO timestamp of last update, or `null` if unset. */
@@ -719,6 +852,10 @@ export interface CreateServicePayload extends CronjobSettings {
   run_command?: string;
   /** Health check path. */
   health_check_path?: string;
+  /** Clone through the GitHub App; the server fills in the repository URL. */
+  github?: { installation_link_id: string; repo_id: number; branch: string };
+  /** Whether a push deploys. Defaults to true server-side for App services. */
+  auto_deploy?: boolean;
 }
 
 /** Payload for {@link PartiriApiClient.updateService}; all fields optional. */
@@ -759,6 +896,8 @@ export interface UpdateServicePayload extends CronjobSettings {
   health_check_path?: string;
   /** New maintenance-mode flag. */
   maintenance_mode?: boolean;
+  /** Whether a push deploys the service (GitHub App services). */
+  auto_deploy?: boolean;
 }
 
 /** A deployment/lifecycle job for a service. */
@@ -773,6 +912,14 @@ export interface Job {
   status: string;
   /** Deployed ref/tag this job targets, or `null` if not applicable. */
   deploy_ref: string | null;
+  /** What queued the job; `null` or absent on old rows. */
+  trigger?:
+    | 'manual'
+    | 'deploy_hook'
+    | 'github_push'
+    | 'rollback'
+    | 'preview'
+    | null;
   /** ISO timestamp of creation, or `null` if unset. */
   created_at: string | null;
   /** ISO timestamp of last update, or `null` if unset. */
@@ -902,4 +1049,181 @@ export interface Volume {
   created_at?: string | null;
   /** ISO timestamp of last update, or `null`/unset if unavailable. */
   updated_at?: string | null;
+}
+
+/** Availability flags from `GET /integrations/github/config`. */
+export interface GithubConfig {
+  /** Whether the GitHub App can be used in the workspace. */
+  enabled: boolean;
+  /** Whether PR previews are available. */
+  previews_enabled: boolean;
+  /** Whether Dockerfile builds are available. */
+  dockerfile_builds_enabled: boolean;
+  /** Slug of the App, when configured. */
+  app_slug?: string;
+}
+
+/** The GitHub identity linked to the API key's owner. */
+export interface GithubIdentity {
+  /** Whether an identity is linked. */
+  connected: boolean;
+  /** GitHub numeric user id. */
+  github_user_id?: number;
+  /** GitHub login. */
+  github_login?: string;
+  /** True when the stored authorization can no longer be used. */
+  reauth_required?: boolean;
+}
+
+/** A GitHub App installation linked to a workspace. */
+export interface GithubInstallation {
+  /** Equals `Service.fk_github_installation`. */
+  id: string;
+  /** Handle the repository and branch routes take. */
+  link_id: string;
+  /** GitHub's installation id. */
+  installation_id: number;
+  /** GitHub account the App is installed on. */
+  account_login: string;
+  /** Account kind. */
+  account_type: 'User' | 'Organization';
+  /** Whether the App sees all repositories or a selection. */
+  repository_selection: 'all' | 'selected' | null;
+  /** Whether the installation is suspended on GitHub. */
+  suspended: boolean;
+  /** When the installation was linked. */
+  linked_at: string;
+  /** GitHub's "configure repository access" page. */
+  settings_url: string;
+}
+
+/** A repository the App can reach. */
+export interface GithubRepo {
+  /** GitHub numeric repository id. */
+  id: number;
+  /** Repository name. */
+  name: string;
+  /** Canonical `owner/repo`. */
+  full_name: string;
+  /** Owner login. */
+  owner_login: string;
+  /** Whether the repository is private. */
+  private: boolean;
+  /** Whether the repository is archived. */
+  archived: boolean;
+  /** Default branch name. */
+  default_branch: string;
+  /** Web URL. */
+  html_url: string;
+  /** Last push time. */
+  pushed_at: string | null;
+}
+
+/** A page of repositories. */
+export interface GithubRepoPage {
+  /** Repositories on this page. */
+  items: GithubRepo[];
+  /** Total matching repositories. */
+  total: number;
+  /** Current page. */
+  page: number;
+  /** Page size. */
+  per_page: number;
+  /** True when GitHub's list was cut short. */
+  truncated: boolean;
+}
+
+/** A repository branch. */
+export interface GithubBranch {
+  /** Branch name. */
+  name: string;
+  /** Whether it is the default branch. */
+  default: boolean;
+  /** Whether it is protected. */
+  protected: boolean;
+  /** Head commit. */
+  commit_sha: string;
+}
+
+/** One suggested service configuration from detection. */
+export interface GithubDetectCandidate {
+  /** Directory the candidate builds from. */
+  root_path: string;
+  /** Detected runtime. */
+  runtime: string;
+  /** Suggested build command. */
+  build_command: string | null;
+  /** Suggested run command. */
+  run_command: string | null;
+  /** Suggested build output path. */
+  build_path: string | null;
+  /** Port the app seems to listen on. */
+  port_hint: number | null;
+  /** How sure detection is. */
+  confidence: 'high' | 'medium' | 'low';
+  /** Which rule produced it. */
+  source: string;
+  /** Files or lines that led to it. */
+  evidence: string[];
+}
+
+/** Result of `GET /integrations/github/repositories/:repoId/detect`. */
+export interface GithubDetectResult {
+  /** Commit the detection ran against. */
+  sha: string;
+  /** Root path inspected. */
+  root_path: string;
+  /** True when the repository tree was too large to scan fully. */
+  truncated: boolean;
+  /** Suggested configurations. */
+  candidates: GithubDetectCandidate[];
+  /** Dockerfile information, when one exists. */
+  dockerfile: Record<string, unknown> | null;
+}
+
+/** A pull-request preview child of a service. */
+export interface ServicePreview {
+  /** Preview service id. */
+  id: string;
+  /** Preview service name. */
+  name: string;
+  /** Pull request number. */
+  pr_number: number;
+  /** Pull request URL. */
+  pr_url: string | null;
+  /** Whether the pull request comes from a fork. */
+  is_fork: boolean;
+  /** Public URL of the preview. */
+  url: string | null;
+  /** The latest job of the preview. */
+  last_job: {
+    id: string;
+    type: string;
+    status: string;
+    deploy_ref: string | null;
+    created_at: string | null;
+  } | null;
+  /** Creation time. */
+  created_at: string | null;
+}
+
+/** Result of `GET /services/:id/previews`. */
+export interface ServicePreviews {
+  /** Current settings. `fk_pod: null` means the parent's pod. */
+  settings: {
+    enabled: boolean;
+    fork_policy: string;
+    share_secrets: boolean;
+    fk_pod: string | null;
+  };
+  /** Whether previews can be enabled for this service. */
+  available: boolean;
+  /** Why not, when unavailable. */
+  unavailable_reason: string | null;
+  /** Workspace-wide live preview limit; `null` is unlimited. */
+  limit: number | null;
+  /** Live previews now. */
+  used: number;
+  /** The previews. */
+  data: ServicePreview[];
 }
