@@ -15,6 +15,7 @@ import * as services from './services.js';
 import * as deployments from './deployments.js';
 import * as metrics from './metrics.js';
 import * as cli from './cli.js';
+import * as github from './github.js';
 
 /**
  * Annotation set required on every tool definition.
@@ -90,6 +91,7 @@ const domains = [
   deployments,
   metrics,
   cli,
+  github,
 ];
 
 /** Flattened tool definitions from every domain, in registration order. */

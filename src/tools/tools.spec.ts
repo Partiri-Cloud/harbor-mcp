@@ -1042,6 +1042,45 @@ describe('validate_service and create_service agree', () => {
     ],
     ['no size', { ...base, fkPod: undefined }],
     [
+      'a valid github source',
+      {
+        ...base,
+        repositoryUrl: undefined,
+        github: { repo: 'org/repo', branch: 'main' },
+      },
+    ],
+    [
+      'github with repositoryUrl',
+      { ...base, github: { repo: 'org/repo', branch: 'main' } },
+    ],
+    [
+      'github with registryUrl',
+      {
+        ...base,
+        repositoryUrl: undefined,
+        registryUrl: 'ghcr.io/org/img:latest',
+        github: { repo: 'org/repo', branch: 'main' },
+      },
+    ],
+    [
+      'github with a secret',
+      {
+        ...base,
+        repositoryUrl: undefined,
+        fkServiceSecret: SECRET_ID,
+        github: { repo: 'org/repo', branch: 'main' },
+      },
+    ],
+    [
+      'github on a database',
+      {
+        ...base,
+        repositoryUrl: undefined,
+        deployType: 'database',
+        github: { repo: 'org/repo', branch: 'main' },
+      },
+    ],
+    [
       'a valid cronjob',
       { ...base, deployType: 'cronjob', cronjobActiveDeadlineSeconds: 300 },
     ],
@@ -1354,6 +1393,9 @@ describe('create_service additional coverage', () => {
   });
 
   it('sends fk_service_secret in update_service request body', async () => {
+    // A source field makes update_service read the service first (to refuse
+    // GitHub App services and previews); this one is a plain token service.
+    fetchMock.mockResolvedValueOnce(jsonResponse({ id: SVC_ID }));
     fetchMock.mockResolvedValueOnce(emptyOkResponse());
 
     const handler = serviceHandlers.get('update_service')!;
@@ -1362,7 +1404,7 @@ describe('create_service additional coverage', () => {
       fkServiceSecret: SECRET_ID,
     });
 
-    const [, opts] = fetchMock.mock.calls[0];
+    const [, opts] = fetchMock.mock.calls[1];
     const body = JSON.parse(opts.body as string);
     expect(body.fk_service_secret).toBe(SECRET_ID);
   });
@@ -1687,5 +1729,514 @@ describe('validate_service annotations (#4)', () => {
     const def = validateDefinitions.find((d) => d.name === 'validate_service')!;
     expect(def.annotations?.readOnlyHint).toBe(false);
     expect(def.annotations?.openWorldHint).toBe(true);
+  });
+});
+
+describe('GitHub App services', () => {
+  let client: PartiriApiClient;
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const LINK = '88888888-8888-4888-8888-888888888888';
+
+  /** Route mocked API calls by method and path. */
+  function route(
+    routes: Record<string, (init: RequestInit) => Response | Promise<Response>>,
+  ) {
+    fetchMock.mockImplementation((url: URL, init: RequestInit) => {
+      const key = `${init.method} ${url.pathname}`;
+      const handler = routes[key];
+      if (!handler) {
+        return Promise.resolve(
+          jsonResponse({ message: `unmocked ${key}` }, 599),
+        );
+      }
+      return Promise.resolve(handler(init));
+    });
+  }
+
+  const githubRoutes = {
+    'GET /projects/66666666-6666-6666-6666-666666666666': () =>
+      jsonResponse({ id: PROJ_ID, fk_workspace: WS_ID }),
+    'GET /integrations/github/config': () =>
+      jsonResponse({
+        enabled: true,
+        previews_enabled: false,
+        dockerfile_builds_enabled: false,
+      }),
+    'GET /integrations/github/me': () =>
+      jsonResponse({ connected: true, github_login: 'me' }),
+    'GET /integrations/github/installations': () =>
+      jsonResponse([
+        {
+          id: 'inst',
+          link_id: LINK,
+          account_login: 'acme',
+          suspended: false,
+          settings_url: 'https://github.com/settings/installations/1',
+        },
+      ]),
+    [`GET /integrations/github/installations/${LINK}/repositories`]: () =>
+      jsonResponse({
+        items: [{ id: 99, full_name: 'acme/widget', archived: false }],
+        total: 1,
+        page: 1,
+        per_page: 100,
+        truncated: false,
+      }),
+    'GET /integrations/github/repositories/99/branches': () =>
+      jsonResponse([
+        { name: 'main', default: true, protected: false, commit_sha: 'a' },
+      ]),
+    'GET /resources/pricing': () => jsonResponse({ pods: [] }),
+  };
+
+  const create = {
+    name: 'my-svc',
+    deployType: 'webservice',
+    runtime: 'node',
+    rootPath: '.',
+    fkProject: PROJ_ID,
+    fkRegion: REGION_ID,
+    fkPod: POD_ID,
+    buildCommand: 'npm run build',
+    runCommand: 'npm start',
+    github: { repo: 'Acme/Widget', branch: 'main' },
+  };
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    client = new PartiriApiClient('test-key', 'https://api.example.com');
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('create_service posts resolved ids, never a repository URL or secret', async () => {
+    let posted: Record<string, unknown> = {};
+    route({
+      ...githubRoutes,
+      'POST /services': (init) => {
+        posted = JSON.parse(init.body as string);
+        return jsonResponse({ id: SVC_ID, fk_pod: POD_ID, replicas: [] });
+      },
+    });
+    const result = await serviceHandlers.get('create_service')!(client, create);
+    expect(result.isError).toBeUndefined();
+    expect(posted.github).toEqual({
+      installation_link_id: LINK,
+      repo_id: 99,
+      branch: 'main',
+    });
+    expect(posted.repository_url).toBeUndefined();
+    expect(posted.fk_service_secret).toBeUndefined();
+    expect(posted.registry_url).toBeUndefined();
+    expect(posted.auto_deploy).toBeUndefined();
+    const data = JSON.parse(resultText(result));
+    expect(data.github_note).toContain('push to main deploys automatically');
+    expect(data.github_note).toContain('deploy_service');
+  });
+
+  it('create_service passes autoDeploy: false and says pushes will not deploy', async () => {
+    let posted: Record<string, unknown> = {};
+    route({
+      ...githubRoutes,
+      'POST /services': (init) => {
+        posted = JSON.parse(init.body as string);
+        return jsonResponse({ id: SVC_ID });
+      },
+    });
+    const result = await serviceHandlers.get('create_service')!(client, {
+      ...create,
+      autoDeploy: false,
+    });
+    expect(posted.auto_deploy).toBe(false);
+    expect(resultText(result)).toContain('will not deploy');
+  });
+
+  it('create_service never creates a service when the repository is not reachable', async () => {
+    const post = vi.fn(() => jsonResponse({ id: SVC_ID }));
+    route({
+      ...githubRoutes,
+      [`GET /integrations/github/installations/${LINK}/repositories`]: () =>
+        jsonResponse({
+          items: [],
+          total: 0,
+          page: 1,
+          per_page: 100,
+          truncated: false,
+        }),
+      'POST /services': post,
+    });
+    const result = await serviceHandlers.get('create_service')!(client, create);
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain("can't see this repository");
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('create_service and validate_service agree on a valid github source', async () => {
+    route({
+      ...githubRoutes,
+      'POST /services': () => jsonResponse({ id: SVC_ID, fk_pod: POD_ID }),
+    });
+    const validated = await validateHandlers.get('validate_service')!(
+      client,
+      create,
+    );
+    expect(JSON.parse(resultText(validated)).valid).toBe(true);
+    const created = await serviceHandlers.get('create_service')!(
+      client,
+      create,
+    );
+    expect(created.isError).toBeUndefined();
+  });
+
+  it('create_service and validate_service both refuse a disabled workspace', async () => {
+    const post = vi.fn(() => jsonResponse({ id: SVC_ID }));
+    route({
+      ...githubRoutes,
+      'GET /integrations/github/config': () => jsonResponse({ enabled: false }),
+      'POST /services': post,
+    });
+    const validated = await validateHandlers.get('validate_service')!(
+      client,
+      create,
+    );
+    expect(JSON.parse(resultText(validated)).valid).toBe(false);
+    const created = await serviceHandlers.get('create_service')!(
+      client,
+      create,
+    );
+    expect(created.isError).toBe(true);
+    expect(resultText(created)).toContain("isn't available");
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('create_service refuses an archived repository before any POST', async () => {
+    const post = vi.fn(() => jsonResponse({ id: SVC_ID }));
+    route({
+      ...githubRoutes,
+      [`GET /integrations/github/installations/${LINK}/repositories`]: () =>
+        jsonResponse({
+          items: [{ id: 99, full_name: 'acme/widget', archived: true }],
+          total: 1,
+          page: 1,
+          per_page: 100,
+          truncated: false,
+        }),
+      'POST /services': post,
+    });
+    const result = await serviceHandlers.get('create_service')!(client, create);
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('archived');
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('create_service refuses github with repositoryBranch before any call', async () => {
+    const result = await serviceHandlers.get('create_service')!(client, {
+      ...create,
+      repositoryBranch: 'dev',
+    });
+    expect(result.isError).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('create_service shows only the code hint for a coded API error', async () => {
+    route({
+      ...githubRoutes,
+      'POST /services': () =>
+        jsonResponse(
+          { error: 'github_installation_forbidden', message: 'nope' },
+          403,
+        ),
+    });
+    const result = await serviceHandlers.get('create_service')!(client, create);
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('no access to that GitHub App');
+    expect(resultText(result)).not.toContain('Verify the required fields');
+  });
+
+  it('update_service shows only the code hint for a coded API error', async () => {
+    route({
+      [`GET /services/${SVC_ID}`]: () =>
+        jsonResponse({ id: SVC_ID, github_repo_id: 42 }),
+      [`PUT /services/${SVC_ID}`]: () =>
+        jsonResponse(
+          { error: 'github_branch_not_found', message: 'no such branch' },
+          400,
+        ),
+    });
+    const result = await serviceHandlers.get('update_service')!(client, {
+      serviceId: SVC_ID,
+      repositoryBranch: 'nope',
+    });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('github_branch_not_found');
+    expect(resultText(result)).toContain("That branch doesn't exist");
+    expect(resultText(result)).not.toContain('Verify the service ID exists');
+  });
+
+  it('update_service keeps the generic hint for uncoded errors', async () => {
+    route({
+      [`GET /services/${SVC_ID}`]: () => jsonResponse({ id: SVC_ID }),
+      [`PUT /services/${SVC_ID}`]: () =>
+        jsonResponse({ error: 'Bad Request', message: 'bad value' }, 400),
+    });
+    const result = await serviceHandlers.get('update_service')!(client, {
+      serviceId: SVC_ID,
+      repositoryBranch: 'main',
+    });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('Verify the service ID exists');
+  });
+
+  it('update_service returns the failure and does not write when the pre-write GET fails', async () => {
+    const put = vi.fn(() => emptyOkResponse());
+    route({
+      [`GET /services/${SVC_ID}`]: () =>
+        jsonResponse({ message: 'upstream down' }, 502),
+      [`PUT /services/${SVC_ID}`]: put,
+    });
+    const result = await serviceHandlers.get('update_service')!(client, {
+      serviceId: SVC_ID,
+      repositoryBranch: 'dev',
+    });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('upstream down');
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('update_service reads the service once when source and pod change together', async () => {
+    let gets = 0;
+    route({
+      [`GET /services/${SVC_ID}`]: () => {
+        gets += 1;
+        return jsonResponse({ id: SVC_ID });
+      },
+      [`PUT /services/${SVC_ID}`]: () => emptyOkResponse(),
+    });
+    await serviceHandlers.get('update_service')!(client, {
+      serviceId: SVC_ID,
+      repositoryBranch: 'dev',
+      fkPod: POD_ID,
+    });
+    expect(gets).toBe(1);
+  });
+
+  it('create_service stops on a missing GitHub identity without creating', async () => {
+    const post = vi.fn(() => jsonResponse({ id: SVC_ID }));
+    route({
+      ...githubRoutes,
+      'GET /integrations/github/me': () => jsonResponse({ connected: false }),
+      'POST /services': post,
+    });
+    const result = await serviceHandlers.get('create_service')!(client, create);
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('Connect your GitHub account first');
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('create_service stops on an unknown branch and lists the branches', async () => {
+    const post = vi.fn(() => jsonResponse({ id: SVC_ID }));
+    route({ ...githubRoutes, 'POST /services': post });
+    const result = await serviceHandlers.get('create_service')!(client, {
+      ...create,
+      github: { repo: 'acme/widget', branch: 'nope' },
+    });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('Branches (default first): main');
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it('create_service refuses github with a repository URL before any call', async () => {
+    const result = await serviceHandlers.get('create_service')!(client, {
+      ...create,
+      repositoryUrl: 'https://github.com/acme/widget',
+    });
+    expect(result.isError).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('create_service and update_service schemas accept the new optional inputs', () => {
+    const c = serviceDefinitions.find((d) => d.name === 'create_service')!;
+    const u = serviceDefinitions.find((d) => d.name === 'update_service')!;
+    expect(
+      c.inputSchema.safeParse({
+        ...create,
+        autoDeploy: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      c.inputSchema.safeParse({ ...create, github: { repo: 'a/b' } }).success,
+    ).toBe(false);
+    expect(
+      u.inputSchema.safeParse({ serviceId: SVC_ID, autoDeploy: false }).success,
+    ).toBe(true);
+  });
+
+  const appService = {
+    id: SVC_ID,
+    github_repo_id: 99,
+    github_repo_full_name: 'acme/widget',
+    repository_url: 'https://github.com/acme/widget',
+    repository_branch: 'main',
+  };
+
+  it('update_service refuses repositoryUrl, fkServiceSecret and registryUrl on an App service', async () => {
+    const put = vi.fn(() => emptyOkResponse());
+    route({
+      [`GET /services/${SVC_ID}`]: () => jsonResponse(appService),
+      [`PUT /services/${SVC_ID}`]: put,
+    });
+    for (const change of [
+      { repositoryUrl: 'https://github.com/other/repo' },
+      { fkServiceSecret: SECRET_ID },
+      { registryUrl: 'ghcr.io/o/i:v1' },
+    ]) {
+      const result = await serviceHandlers.get('update_service')!(client, {
+        serviceId: SVC_ID,
+        ...change,
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toContain('partiri service github');
+    }
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('update_service allows a branch change and autoDeploy on an App service', async () => {
+    let body: Record<string, unknown> = {};
+    route({
+      [`GET /services/${SVC_ID}`]: () => jsonResponse(appService),
+      [`PUT /services/${SVC_ID}`]: (init) => {
+        body = JSON.parse(init.body as string);
+        return emptyOkResponse();
+      },
+    });
+    const result = await serviceHandlers.get('update_service')!(client, {
+      serviceId: SVC_ID,
+      repositoryBranch: 'dev',
+      autoDeploy: false,
+    });
+    expect(result.isError).toBeUndefined();
+    expect(body).toEqual({ repository_branch: 'dev', auto_deploy: false });
+  });
+
+  it('update_service refuses source fields on a preview child', async () => {
+    const put = vi.fn(() => emptyOkResponse());
+    route({
+      [`GET /services/${SVC_ID}`]: () =>
+        jsonResponse({
+          id: SVC_ID,
+          fk_parent_service: 'parent-1',
+          preview_pr_number: 7,
+        }),
+      [`PUT /services/${SVC_ID}`]: put,
+    });
+    const result = await serviceHandlers.get('update_service')!(client, {
+      serviceId: SVC_ID,
+      repositoryBranch: 'dev',
+    });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain('preview of pull request #7');
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it('update_service does not read the service for unrelated changes', async () => {
+    route({ [`PUT /services/${SVC_ID}`]: () => emptyOkResponse() });
+    await serviceHandlers.get('update_service')!(client, {
+      serviceId: SVC_ID,
+      buildCommand: 'make',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('update_service lets a plain repository service change its source', async () => {
+    route({
+      [`GET /services/${SVC_ID}`]: () =>
+        jsonResponse({ id: SVC_ID, repository_url: 'x' }),
+      [`PUT /services/${SVC_ID}`]: () => emptyOkResponse(),
+    });
+    const result = await serviceHandlers.get('update_service')!(client, {
+      serviceId: SVC_ID,
+      repositoryUrl: 'https://github.com/other/repo',
+    });
+    expect(result.isError).toBeUndefined();
+  });
+
+  it('get_service adds source for App, plain and preview services', async () => {
+    const get = serviceHandlers.get('get_service')!;
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        ...appService,
+        auto_deploy: true,
+        previews_enabled: true,
+        github_disconnected_at: '2026-01-01',
+      }),
+    );
+    const app = JSON.parse(
+      resultText(await get(client, { serviceId: SVC_ID })),
+    );
+    expect(app.source).toEqual({
+      kind: 'github_app',
+      repo: 'acme/widget',
+      branch: 'main',
+      auto_deploy: true,
+      github_disconnected: true,
+      previews_enabled: true,
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: SVC_ID,
+        deploy_type: 'webservice',
+        repository_url: 'https://github.com/o/r',
+        repository_branch: 'main',
+        env: [{ key: 'A', value: 'b' }],
+      }),
+    );
+    const plain = JSON.parse(
+      resultText(await get(client, { serviceId: SVC_ID })),
+    );
+    expect(plain.source.kind).toBe('repository');
+    expect(plain.source.is_preview).toBeUndefined();
+    expect(plain.env).toBeUndefined();
+    expect(plain.repository_url).toBe('https://github.com/o/r');
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        id: SVC_ID,
+        registry_url: 'ghcr.io/o/i:v1',
+        fk_parent_service: 'parent-1',
+        preview_pr_number: 3,
+      }),
+    );
+    const prev = JSON.parse(
+      resultText(await get(client, { serviceId: SVC_ID })),
+    );
+    expect(prev.source).toMatchObject({
+      kind: 'registry',
+      is_preview: true,
+      preview_pr_number: 3,
+      parent_service_id: 'parent-1',
+    });
+  });
+
+  it('list_jobs reports trigger, null on old rows', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        total: 2,
+        data: [
+          { id: 'j1', status: 'succeeded', trigger: 'github_push' },
+          { id: 'j2', status: 'failed' },
+        ],
+      }),
+    );
+    const { handlers: jobHandlers } = await import('./deployments.js');
+    const result = await jobHandlers.get('list_jobs')!(client, {
+      serviceId: SVC_ID,
+    });
+    const data = JSON.parse(resultText(result));
+    expect(data.jobs.map((j: { trigger: unknown }) => j.trigger)).toEqual([
+      'github_push',
+      null,
+    ]);
   });
 });

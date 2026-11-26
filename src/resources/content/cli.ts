@@ -44,7 +44,10 @@ These work on every subcommand:
 - \`partiri service pause\` / \`partiri service unpause\` — Pause or resume the service. Both prompt for confirmation by default.
 - \`partiri service kill\` — Permanently stop the service. Prompts for confirmation by default.
 - \`partiri service link\` — Fill in workspace, project, region and pod UUIDs in one call. Interactive when no flags are passed; non-interactive with \`--workspace --project --region --pod\` (and optional \`--token <UUID>\` / \`--clear-token\`). Workspace and project must change together; region and pod must change together.
-- \`partiri service token\` — Link an authentication token for private repositories or registries (\`--secret <UUID>\` to set, \`--clear\` to remove).
+- \`partiri service token\` — Link an authentication token for private repositories or registries (\`--secret <UUID>\` to set, \`--clear\` to remove). Not used by GitHub App services.
+- \`partiri github setup\` — Link your GitHub account and install the Partiri GitHub App (opens the dashboard). \`partiri github status\` / \`partiri github repos\` read the state.
+- \`partiri service github connect\` / \`disconnect\` — Switch an existing service to or from the GitHub App. Connecting redeploys the service and stops its old deploy webhook; disconnecting stops push deploys.
+- \`partiri service previews enable|disable\` — Pull-request previews. Each preview is charged a pod month when created, refunded pro rata when removed.
 - \`partiri service env [--path <.env>] [--save]\` — Manage runtime env vars. Without flags, prints the env vars currently stored on the service. With \`--path\`, parses the dotenv file and **replaces** the service's env vars in full. With \`--save\`, fetches the service's env vars and writes them to \`.env.partiri\` in the current directory (gitignore it — contains secrets). Env vars are never stored in \`.partiri.jsonc\`.
 
 ## Secrets
@@ -221,7 +224,9 @@ For agents, the canonical machine-readable schema is \`partiri llm schema --json
 | \`repository_url\` | Git repository URL. Mutually exclusive with \`registry_url\`. Required for \`deploy_type: static\`. |
 | \`repository_branch\` | Branch to deploy. |
 | \`registry_url\` | Full container image reference (e.g. \`ghcr.io/owner/image:tag\`). The API splits host, repository, and tag server-side. Use instead of \`repository_url\` for Docker images. Not supported for \`static\`. |
-| \`service_secret\` | Authentication token for private repository or registry access. Set via \`partiri service token\`. |
+| \`service_secret\` | Authentication token for private repository or registry access. Set via \`partiri service token\`. Not used with \`github_app\`. |
+| \`github_app\` | \`true\` when the service clones through the GitHub App: no \`service_secret\`, repository stays in \`repository_url\`. Only \`partiri service github connect|disconnect\` changes it on an existing service; \`push\` never does. It is a local marker and is never sent to the API. |
+| \`auto_deploy\` | Whether a push to the branch deploys (GitHub App services). |
 | \`build_command\` | Command to build the project. Leave empty if not needed. |
 | \`build_path\` | Output directory of the build step (e.g. \`dist\`). Required for \`deploy_type: static\`. |
 | \`pre_deploy_command\` | Runs before each deployment, after build and before start (e.g. database migrations). |

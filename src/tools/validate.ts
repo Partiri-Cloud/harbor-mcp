@@ -10,6 +10,7 @@ import {
   recurringMonthly,
 } from './cost.js';
 import { serviceRules } from './service-rules.js';
+import { GithubResolveError, resolveRepoAndBranch } from './github.js';
 
 /** Allowed `deploy_type` values for a service. */
 const deployTypeEnum = z.enum([
@@ -77,6 +78,7 @@ export const definitions: ToolDefinition[] = [
       'Checks source XOR rule (repository vs registry), deploy_type/runtime compatibility, ' +
       'and name length (≤16). When probeReachability is set, performs an OUTBOUND network ' +
       'probe of the supplied git repository or registry URL (not side-effect-free). ' +
+      'With `github`, also checks (via the API) that the GitHub App can reach the repository and the branch exists. ' +
       'Returns a list of checks with ok/fail status.',
     inputSchema: z.object({
       name: z.string().describe('Service name to validate'),
@@ -119,6 +121,13 @@ export const definitions: ToolDefinition[] = [
         .describe(
           "Hard kill-timeout for a single run (1-3600). Required for a 'cronjob'; also bounds the per-run cost estimate.",
         ),
+      fkProject: z
+        .string()
+        .uuid()
+        .optional()
+        .describe(
+          'Project UUID. With `github`, the workspace is taken from it when workspaceId is omitted, as create_service does.',
+        ),
       workspaceId: z
         .string()
         .uuid()
@@ -148,6 +157,19 @@ export const definitions: ToolDefinition[] = [
         ),
       buildCommand: z.string().optional().describe('Build command'),
       runCommand: z.string().optional().describe('Run command'),
+      github: z
+        .object({
+          repo: z.string().max(200).describe('Repository as owner/repo'),
+          branch: z.string().min(1).max(255).describe('Branch to deploy from'),
+        })
+        .optional()
+        .describe(
+          'GitHub App source (as in create_service). Mutually exclusive with repositoryUrl, registryUrl and fkServiceSecret. Needs workspaceId or fkProject: the repository and branch are checked against the App.',
+        ),
+      autoDeploy: z
+        .boolean()
+        .optional()
+        .describe('Deploy on every push (GitHub App services)'),
       diskSizeGb: z
         .number()
         .int()
@@ -252,6 +274,74 @@ function registryHostIsPublic(ref: string): boolean {
   const host =
     (first.match(/:/g) || []).length === 1 ? first.split(':')[0] : first;
   return !isPrivateOrSpecialHost(host);
+}
+
+/** The workspace named by the caller, or the one of `fkProject` as in create. */
+async function githubWorkspace(
+  client: PartiriApiClient,
+  args: Record<string, unknown>,
+): Promise<string | undefined> {
+  const workspaceId = args.workspaceId as string | undefined;
+  if (workspaceId) return workspaceId;
+  const projectId = args.fkProject as string | undefined;
+  return projectId
+    ? (await client.getProject(projectId)).fk_workspace
+    : undefined;
+}
+
+/**
+ * Remote checks for a GitHub App source: identity, installation, repository
+ * and branch, using the same resolver as `create_service`.
+ */
+async function githubChecks(
+  client: PartiriApiClient,
+  args: Record<string, unknown>,
+): Promise<ValidationCheck[]> {
+  const github = args.github as { repo: string; branch: string } | undefined;
+  if (!github) return [];
+  try {
+    const workspaceId = await githubWorkspace(client, args);
+    if (!workspaceId) {
+      return [
+        {
+          field: 'github_repository',
+          ok: false,
+          message:
+            'workspaceId or fkProject is required to check the GitHub repository (the GitHub App is resolved per workspace)',
+        },
+      ];
+    }
+    const resolved = await resolveRepoAndBranch(
+      client,
+      workspaceId,
+      github.repo,
+      github.branch,
+    );
+    return [
+      {
+        field: 'github_repository',
+        ok: true,
+        message: `${resolved.repo.full_name} is reachable through the GitHub App`,
+      },
+      {
+        field: 'github_branch',
+        ok: true,
+        message: `Branch ${github.branch} exists`,
+      },
+    ];
+  } catch (e) {
+    const code = e instanceof GithubResolveError ? e.code : undefined;
+    return [
+      {
+        field:
+          code === 'github_branch_not_found'
+            ? 'github_branch'
+            : 'github_repository',
+        ok: false,
+        message: (e as Error).message,
+      },
+    ];
+  }
 }
 
 /** Handler implementations for the tools declared in `definitions`. */
@@ -359,7 +449,11 @@ export const handlers: Map<string, ToolHandler> = new Map([
         }
       }
 
-      const allChecks = [...checks, ...reachabilityChecks];
+      const allChecks = [
+        ...checks,
+        ...reachabilityChecks,
+        ...(await githubChecks(client, args)),
+      ];
       const passed = allChecks.filter((c) => c.ok).length;
       const failed = allChecks.filter((c) => !c.ok).length;
 

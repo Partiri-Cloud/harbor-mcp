@@ -29,7 +29,10 @@ import type { ToolDefinition, ToolHandler } from './index.js';
 const CLI_ONLY_AREAS =
   'workspace secrets (secret create-repository / create-registry), ' +
   'volume detach/delete (partiri storage detach|delete), service kill, ' +
-  'and service environment variables (partiri service env)';
+  'service environment variables (partiri service env), ' +
+  'GitHub source changes (partiri service github connect|disconnect), ' +
+  'pull-request preview settings (partiri service previews enable|disable), ' +
+  'and linking the GitHub account (partiri github setup, or the dashboard)';
 
 /**
  * Build the advisory guidance text returned by the `use_partiri_cli` tool.
@@ -88,7 +91,7 @@ export const definitions: ToolDefinition[] = [
     title: 'Get Partiri CLI Guidance',
     description:
       'Guidance for running the locally-installed `partiri` CLI yourself for sensitive operations that are intentionally not exposed as direct MCP tools: ' +
-      'managing workspace secrets (`partiri secret create-repository` / `create-registry`), detaching or deleting a volume (`partiri storage detach` / `delete`), killing a service (`partiri service kill`), and managing service environment variables (`partiri service env`). ' +
+      'managing workspace secrets (`partiri secret create-repository` / `create-registry`), detaching or deleting a volume (`partiri storage detach` / `delete`), killing a service (`partiri service kill`), managing service environment variables (`partiri service env`), changing the GitHub source of a service (`partiri service github connect|disconnect`), pull-request preview settings (`partiri service previews enable|disable`), and linking the GitHub account (`partiri github setup`). ' +
       'This tool does NOT execute anything — it returns instructions for you to run the command in your own shell. ' +
       'These operations are kept CLI-only because they pass long-lived credentials or cause irreversible data loss, and the CLI authenticates independently of the MCP session. ' +
       'Note: creating, attaching, or retry-provisioning a volume has no CLI subcommand — use the dashboard or API. Service-scoped commands like `service kill` read the service ID from a local `.partiri.jsonc` (only `service deploy` accepts `--service <UUID>`). ' +

@@ -45,6 +45,8 @@ Deploying your first app takes just a few steps:
 2. **Pick your location and pod size** — all available regions are based in Europe.
 3. **Hit deploy.**
 
+For GitHub repositories you can skip the token: install the Partiri GitHub App from the dashboard (workspace settings, GitHub card), create the service with \`create_service\` and \`github: { repo, branch }\`, run the first deploy, and every later push deploys automatically. See \`partiri://docs/services/github-app\`.
+
 That's it. We build your app, assign it a subdomain, and it's live. No infrastructure to configure, no YAML to wrestle with.`,
   },
   {

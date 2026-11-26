@@ -59,7 +59,7 @@ export const definitions: ToolDefinition[] = [
     name: 'list_jobs',
     title: 'List Deployment Jobs',
     description:
-      'List deployment jobs for a service. Returns job id, type, status (open, in_progress, succeeded, failed, canceled, timed_out), and timestamps. Use after deploy_service to track progress.',
+      'List deployment jobs for a service. Returns job id, type, status (open, in_progress, succeeded, failed, canceled, timed_out), trigger (manual, deploy_hook, github_push, rollback, preview, or null on old jobs), and timestamps. Use after deploy_service to track progress.',
     inputSchema: z.object({
       serviceId: z.string().uuid().describe('The service UUID'),
     }),
@@ -124,7 +124,7 @@ export const handlers: Map<string, ToolHandler> = new Map([
         return toolResult({
           count: result.data.length,
           total: result.total,
-          jobs: result.data,
+          jobs: result.data.map((j) => ({ ...j, trigger: j.trigger ?? null })),
         });
       } catch (e) {
         return toolError((e as Error).message, SERVICE_HINT);

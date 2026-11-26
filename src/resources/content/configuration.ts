@@ -116,6 +116,8 @@ They are useful for CI/CD pipelines that are not connected via Git push webhooks
 
 No request body or authentication header is required — the URL itself acts as the secret.
 
+A GitHub App service deploys on every push without a deploy hook (\`autoDeploy\`). When a service is connected to the App, its old deploy webhook stops working and should be removed from the repository on GitHub.
+
 You can regenerate the deploy hook URL at any time to invalidate the previous one. Deploy hooks trigger a deployment of the current branch and configuration, the same as pressing the Deploy button.`,
   },
   {
