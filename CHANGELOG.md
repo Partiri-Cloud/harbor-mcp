@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-26
+
+### Added
+
+- **GitHub App support.** A service can be created from a GitHub repository through
+  the Partiri GitHub App: no access token, and every push to the branch deploys it.
+  - New read-only tools: `github_status` (whether the App is available in the
+    workspace, whether the API key owner's GitHub account is connected or needs
+    reconnecting, and the accounts the App is installed on), `list_github_repos`,
+    `list_github_branches`, `detect_service_config` (suggested runtime, build and run
+    commands and port) and `get_service_previews`.
+  - `create_service` accepts `github: { repo, branch }` in place of a repository URL
+    and token, plus `autoDeploy`. The repository and branch are checked through the
+    App before anything is created.
+  - `update_service` accepts `autoDeploy`, and refuses to change the source of a
+    GitHub App service or to edit a pull-request preview.
+  - `validate_service` checks the repository and branch of a `github` source.
+  - `list_jobs` returns each job's `trigger` (`manual`, `deploy_hook`, `github_push`,
+    `rollback`, `preview`, or `null` on old jobs).
+  - Connecting or disconnecting a service and enabling or disabling previews stay
+    CLI-only; `use_partiri_cli` explains them.
+  - Errors from the GitHub integration return a hint specific to their error code.
+  - New docs resource: `partiri://docs/services/github-app`.
+
 ### Fixed
 
 - A stale or expired `x-api-key` in a client's configuration no longer suppresses
